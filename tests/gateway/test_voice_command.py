@@ -61,6 +61,9 @@ def _unbound_voice_adapter() -> AsyncMock:
     adapter = AsyncMock()
     adapter._voice_text_channels, adapter._voice_sources = {111: 123}, {}
     adapter._client = MagicMock()
+    adapter._resolve_channel_prompt = MagicMock(return_value=None)
+    adapter._resolve_channel_skills = MagicMock(return_value=None)
+    adapter._guild_channel_labels = MagicMock(return_value=None)
     adapter.handle_message = AsyncMock()
     adapter._thread_id_and_chat_for_channel = MagicMock(return_value=(None, "123"))
     adapter.build_source = MagicMock(side_effect=lambda **kw: SessionSource(platform=Platform.DISCORD, **kw))
