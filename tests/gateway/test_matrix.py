@@ -1754,7 +1754,7 @@ async def test_matrix_edit_budget_and_cached_parent(transport_outcome, parent_re
 
     expected_results = {
         "success": SendResult(success=True, message_id="$edit"),
-        "failure": SendResult(success=False, error="send failed"),
+        "failure": SendResult(success=False, error=f"Matrix target '{room_id}': send failed"),
         "cancelled": None,
     }
     expected_context = prior
