@@ -5,14 +5,16 @@ import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.config import PlatformConfig
+
 # ``_send_dingtalk`` and ``_send_matrix`` moved into their bundled plugins
 # (``plugins/platforms/<x>/adapter.py::_standalone_send``) in #41112. Keep
 # thin pre-migration-shaped shims so existing test bodies work unchanged.
 from plugins.platforms.dingtalk.adapter import (
     _standalone_send as _dingtalk_standalone_send,
 )
-from plugins.platforms.matrix.adapter import (
-    _standalone_send as _matrix_standalone_send,
+from plugins.platforms.matrix.standalone import (
+    standalone_send as _matrix_standalone_send,
 )
 
 
@@ -26,7 +28,7 @@ async def _send_dingtalk(extra, chat_id, message):
 async def _send_matrix(token, extra, chat_id, message):
     """Pre-migration ``(token, extra, chat_id, message)`` shim around the matrix
     plugin's ``_standalone_send(pconfig, chat_id, message)``."""
-    pconfig = SimpleNamespace(token=token, extra=extra or {})
+    pconfig = PlatformConfig(token=token, extra=extra or {})
     return await _matrix_standalone_send(pconfig, chat_id, message)
 
 # ``_send_mattermost`` moved into the mattermost plugin
