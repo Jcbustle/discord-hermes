@@ -25,7 +25,7 @@ from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_busy import approval_input_words
 from gateway.run_common import _UNSET
-from gateway.run_inbound_media import rehome_inbound_media
+from gateway.run_inbound_media import rehome_inbound_media, rehomed_media_path
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_inbound_turn_context import prepend_turn_context_note, turn_context_update
 from gateway.run_inbound_unauthorized import (
