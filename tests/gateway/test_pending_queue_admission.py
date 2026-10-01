@@ -192,9 +192,7 @@ async def test_admission_at_capacity_preserves_the_complete_fifo(path, monkeypat
                 if path
                 in {
                     "cancel-claimed",
-                    "cancel-claim-race",
                     "cancel-claim-complete",
-                    "cancel-claim-replaced",
                 }
                 else expected,
                 {"shared": incoming} if path == "cancel-claim-replaced" else {},
