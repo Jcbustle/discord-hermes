@@ -1,12 +1,15 @@
 """Pending-event attribution and dispatch ownership for gateway adapters."""
 
 import asyncio
-from contextlib import contextmanager
+import logging
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Iterator
 
 from gateway.platforms.event import MessageEvent
+
+logger = logging.getLogger(__name__)
 
 
 _SECURITY_METADATA_KEYS = (
@@ -52,21 +55,104 @@ def _can_join_pending_event(first: MessageEvent, second: MessageEvent) -> bool:
     )
 
 
+@dataclass
+class _PendingDispatchReservation:
+    event: MessageEvent
+    claimed: bool = False
+    preserve_on_completion: bool = False
+    input_session_id: str | None = None
+    input_owner: str | None = None
+
+
 @dataclass(frozen=True)
 class _PendingDispatch:
     adapter: object
     session_key: str
     event: MessageEvent
     task: asyncio.Task | None
+    reservation: _PendingDispatchReservation | None
 
 
 _dispatch: ContextVar[_PendingDispatch | None] = ContextVar("pending_dispatch", default=None)
 
 
+def reserve_pending_dispatch(adapter: object, session_key: str, event: MessageEvent) -> None:
+    reservations = getattr(adapter, "_pending_dispatch_reservations", None)
+    if reservations is None:
+        reservations = {}
+        setattr(adapter, "_pending_dispatch_reservations", reservations)
+    reservations[session_key] = _PendingDispatchReservation(event)
+
+
+def release_pending_dispatch(adapter: object, session_key: str, event: MessageEvent, *,
+                             claimed: bool = False) -> None:
+    reservations = getattr(adapter, "_pending_dispatch_reservations", None)
+    if not isinstance(reservations, dict):
+        return
+    reserved = reservations.get(session_key)
+    dispatch = _dispatch.get()
+    if reserved is None:
+        return
+    if reserved.event is event or (dispatch is not None and reserved.event is dispatch.event
+                            and dispatch.adapter is adapter and dispatch.session_key == session_key
+                            and dispatch.task is asyncio.current_task()):
+        reserved.claimed = claimed
+        if reserved.preserve_on_completion and not reserved.claimed:
+            return
+        reservations.pop(session_key, None)
+
+
+def bind_pending_dispatch_input(session_id: str, owner: str) -> None:
+    """Associate the current provisional dispatch with its transcript input."""
+    dispatch = _dispatch.get()
+    if dispatch is None or dispatch.task is not asyncio.current_task():
+        return
+    if dispatch.reservation is None:
+        return
+    dispatch.reservation.input_session_id = session_id
+    dispatch.reservation.input_owner = owner
+
+
+def pending_dispatch_needs_snapshot(
+    adapter: object, reserved: _PendingDispatchReservation
+) -> bool:
+    """Whether this provisional input still needs shutdown preservation."""
+    if reserved.claimed:
+        return False
+    if not reserved.input_session_id or not reserved.input_owner:
+        return True
+    runner = getattr(adapter, "gateway_runner", None)
+    if runner is None:
+        return True
+    scope = getattr(runner, "_profile_scope_for_source", None)
+    try:
+        with scope(reserved.event.source) if callable(scope) else nullcontext():
+            return not runner.session_store.has_input_owner(
+                reserved.input_session_id,
+                reserved.input_owner,
+            )
+    except Exception:
+        logger.warning(
+            "Could not verify durable pending input; preserving the event",
+            exc_info=True,
+        )
+        return True
+
+
 @contextmanager
 def pending_dispatch_scope(adapter: object, session_key: str,
                            event: MessageEvent) -> Iterator[None]:
-    token = _dispatch.set(_PendingDispatch(adapter, session_key, event, asyncio.current_task()))
+    reservations = getattr(adapter, "_pending_dispatch_reservations", {})
+    reservation = (
+        reservations.get(session_key) if isinstance(reservations, dict) else None
+    )
+    if reservation is not None and reservation.event is not event:
+        reservation = None
+    token = _dispatch.set(
+        _PendingDispatch(
+            adapter, session_key, event, asyncio.current_task(), reservation
+        )
+    )
     try:
         yield
     finally:
