@@ -103,18 +103,21 @@ def release_pending_dispatch(
         return
     reserved = reservations.get(session_key)
     dispatch = _dispatch.get()
-    if reserved is None:
-        return
-    if reserved.event is event or (
+    owning_dispatch = (
         dispatch is not None
-        and reserved.event is dispatch.event
         and dispatch.adapter is adapter
         and dispatch.session_key == session_key
         and dispatch.task is asyncio.current_task()
-    ):
-        reserved.claimed = claimed
-        if reserved.preserve_on_completion and not reserved.claimed:
-            return
+    )
+    record = reserved if reserved is not None and reserved.event is event else None
+    if record is None and owning_dispatch:
+        record = dispatch.reservation
+    if record is None:
+        return
+    record.claimed = record.claimed or claimed
+    if record.preserve_on_completion and not record.claimed:
+        return
+    if reserved is record:
         reservations.pop(session_key, None)
 
 
