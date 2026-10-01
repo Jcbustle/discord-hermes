@@ -85,6 +85,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
     _peek_session_state: Callable[[str], Optional[SessionState]]
 
     if TYPE_CHECKING:
+        _delivery_adapter_for: Callable[[Optional[SessionSource]], Optional[BasePlatformAdapter]]
         _flush_buffered_pending: Callable[[str, BasePlatformAdapter], None]
         _overflow_queue: Callable[[str], Optional[List[MessageEvent]]]
         _queue_or_replace_pending_event = GatewayRunner._queue_or_replace_pending_event
@@ -439,7 +440,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 # reaches the click handler, so the card would keep its buttons forever.
                 if callable(getattr(type(_clarify_adapter), "retire_clarify_card", None)):
                     try:
-                        await _clarify_adapter.retire_clarify_card(
+                        await getattr(_clarify_adapter, "retire_clarify_card")(
                             _pending_clarify.clarify_id,
                             t("gateway.clarify.answered",
                               response=_raw_clarify_reply if _pending_clarify.response == _clarify_mod.SKIPPED
@@ -462,9 +463,11 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 # notice (scheduled once the wait unblocks) finds nothing and stays a no-op.
                 _clarify_adapter = self._delivery_adapter_for(source)
                 # Class lookup: a MagicMock adapter must not fabricate the method.
-                if callable(getattr(type(_clarify_adapter), "retire_clarify_card", None)):
+                if _clarify_adapter is not None and callable(
+                    getattr(type(_clarify_adapter), "retire_clarify_card", None)
+                ):
                     try:
-                        await _clarify_adapter.retire_clarify_card(
+                        await getattr(_clarify_adapter, "retire_clarify_card")(
                             _pending_clarify.clarify_id,
                             t("gateway.clarify.cancelled"))
                     except Exception:
@@ -1386,6 +1389,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
 
         event, source, is_internal = self._hm_rescue_orphaned_fifo(event, source, is_internal, _quick_key)
 
+        from gateway.platforms.base_pending import release_pending_dispatch
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
@@ -1402,6 +1406,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                 from gateway.run_inbound_consumer import run_post_admission_hook
                 _consumed, _consumer_reply = await run_post_admission_hook(self, event, source, _quick_key)
                 if _consumed:
+                    release_pending_dispatch(self._delivery_adapter_for(source), _quick_key, event, claimed=True)
                     return _consumer_reply
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
@@ -1414,7 +1419,9 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
                     "the user must resend",
                     _quick_key, exc.session_id,
                 )
+                release_pending_dispatch(self._delivery_adapter_for(source), _quick_key, event, claimed=True)
                 return t("gateway.busy.another_turn_running")
+            release_pending_dispatch(self._delivery_adapter_for(source), _quick_key, event, claimed=True)
             try:
                 await self._run_post_turn_hooks(
                     agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
