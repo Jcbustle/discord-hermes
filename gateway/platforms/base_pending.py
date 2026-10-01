@@ -91,14 +91,17 @@ def release_pending_dispatch(adapter: object, session_key: str, event: MessageEv
         return
     reserved = reservations.get(session_key)
     dispatch = _dispatch.get()
-    if reserved is None:
+    owning_dispatch = (dispatch is not None and dispatch.adapter is adapter
+                       and dispatch.session_key == session_key and dispatch.task is asyncio.current_task())
+    record = reserved if reserved is not None and reserved.event is event else None
+    if record is None and owning_dispatch:
+        record = dispatch.reservation
+    if record is None:
         return
-    if reserved.event is event or (dispatch is not None and reserved.event is dispatch.event
-                            and dispatch.adapter is adapter and dispatch.session_key == session_key
-                            and dispatch.task is asyncio.current_task()):
-        reserved.claimed = claimed
-        if reserved.preserve_on_completion and not reserved.claimed:
-            return
+    record.claimed = record.claimed or claimed
+    if record.preserve_on_completion and not record.claimed:
+        return
+    if reserved is record:
         reservations.pop(session_key, None)
 
 
@@ -143,16 +146,10 @@ def pending_dispatch_needs_snapshot(
 def pending_dispatch_scope(adapter: object, session_key: str,
                            event: MessageEvent) -> Iterator[None]:
     reservations = getattr(adapter, "_pending_dispatch_reservations", {})
-    reservation = (
-        reservations.get(session_key) if isinstance(reservations, dict) else None
-    )
+    reservation = reservations.get(session_key) if isinstance(reservations, dict) else None
     if reservation is not None and reservation.event is not event:
         reservation = None
-    token = _dispatch.set(
-        _PendingDispatch(
-            adapter, session_key, event, asyncio.current_task(), reservation
-        )
-    )
+    token = _dispatch.set(_PendingDispatch(adapter, session_key, event, asyncio.current_task(), reservation))
     try:
         yield
     finally:
