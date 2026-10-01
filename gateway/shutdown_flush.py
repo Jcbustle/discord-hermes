@@ -459,7 +459,17 @@ def recover_pending_spool(session_db=None, *, session_resolver=None) -> tuple[in
                 continue
             messages = [message for _path, batch in entries for message in batch]
             try:
-                recovered += _append_recovered_transcript(session_db, session_id, messages)
+                from agent.message_metadata import message_uid_or_none
+                unique_messages: Dict[str, dict] = {}
+                for message in messages:
+                    uid = message_uid_or_none(message)
+                    if uid is None:
+                        raise ValueError("recovery message_uid is required")
+                    previous = unique_messages.get(uid)
+                    if previous is not None and previous != message:
+                        raise ValueError(f"conflicting recovery copies for message_uid: {uid}")
+                    unique_messages.setdefault(uid, message)
+                recovered += _append_recovered_transcript(session_db, session_id, list(unique_messages.values()))
             except Exception as exc:
                 if is_row_rejection(exc):
                     for path, _messages in entries:
