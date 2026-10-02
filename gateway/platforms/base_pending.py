@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import itertools
 import logging
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -41,6 +42,14 @@ _SECURITY_METADATA_KEYS = (
     "gateway_session_strict",
     "notification_category",
 )
+
+_INGRESS_SEQUENCE = itertools.count()
+
+
+def ingress_order(event: MessageEvent) -> int:
+    if event._ingress_order is None:
+        event._ingress_order = next(_INGRESS_SEQUENCE)
+    return event._ingress_order
 
 
 def _sender_identity(event: MessageEvent) -> tuple[str, ...] | None:
