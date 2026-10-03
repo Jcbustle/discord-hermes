@@ -484,7 +484,13 @@ class TestCmdUpdateGatewayMode:
         git("remote", "add", "origin", str(root))
         (root / "notes.txt").write_text("user edit\n", encoding="utf-8")
         monkeypatch.setattr(main, "PROJECT_ROOT", root)
-        # Isolate host/service phases; options, Git, stash and prompt dispatch stay real.
+        # Isolate the owning-install retarget: it probes sys.prefix (the real
+        # venv) and would redirect to an unrelated install; this test only
+        # exercises the stash-restore + gateway-prompt dispatch path.
+        monkeypatch.setattr(
+            "hermes_cli.update_owning_install.retarget_to_owning_install",
+            lambda *a, **k: None,
+        )
         monkeypatch.setattr(main, "_update_preflight_handled", lambda args: False)
         monkeypatch.setattr(main, "_install_hangup_protection", lambda **kw: None)
         monkeypatch.setattr(main, "_finalize_update_output", lambda state: None)
