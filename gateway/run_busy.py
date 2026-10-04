@@ -92,6 +92,9 @@ def _same_chat_key_slots(
 class GatewayBusySessionMixin:
     """Busy-session queueing, slot claims, slash dispatch tables, destructive-slash confirmation."""
 
+    if TYPE_CHECKING:
+        _BUSY_QUEUE_MAX_PENDING: int
+
     def _queue_during_drain_enabled(self, busy_input_mode: Optional[str] = None) -> bool:
         # "queue"/"steer" mean messages survive a restart (queued for the new process); "interrupt" drops.
         mode = busy_input_mode or self._busy_input_mode
