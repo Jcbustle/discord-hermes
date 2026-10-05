@@ -26,6 +26,20 @@ LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
 
 
+def observe_durable_turn(lease, action: str, value=None) -> None:
+    """Publish an admitted lease's observation lifecycle; lease-less turns stay unknown."""
+    if lease is None:
+        return
+    if action == "begin":
+        lease.begin_observation()
+    elif action == "result":
+        lease.finish_observation_result(value)
+    elif action == "exception":
+        lease.finish_observation_exception(value)
+    else:
+        raise ValueError("Unknown observation lifecycle action")
+
+
 class DurableTurnLease:
     """An admitted session turn lease plus the periodic timers that keep it alive and watch the turn.
 
