@@ -26,6 +26,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
+from gateway.response_filters import is_machinery_display_kind
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -1659,8 +1660,27 @@ class TurnRunner:
         # Safety net: a startup auto-resume event carries empty text; if the resume_pending branch
         # did not fire (freshness signals disagreed, marker cleared) we must NOT hand the model a blank
         # user turn. Restricted to resume_pending sessions so caption-less image turns are untouched.
-        if isinstance(ctx.message, str) and not ctx.message.strip() and resume_pending:
+        # ponytail: the turn's own machinery display-kind (stamped from the event's internal flag at
+        # intake) is the fallback signal, not a re-read of the session store — a store round-trip here
+        # would need async plumbing for a race the event already disambiguates. Any other blank
+        # self-injected turn gets the generic interruption wording instead of a user-visible non-answer.
+        if (
+            isinstance(ctx.message, str)
+            and not ctx.message.strip()
+            and (resume_pending or is_machinery_display_kind(ctx.persist_user_display_kind))
+        ):
             ctx.message = build_resume_recovery_note(resume_reason, "", interactive=self._resume_note_interactive())
+        # The tool-tail branch above captures the raw message into ``persist_override``; for a blank
+        # self-injected resume landing on an interrupted tool row that override is "" while the
+        # prepended system note makes the check above pass — and an empty override persists a blank
+        # user row the pre-call sanitizer re-heals on every later call (#120963 shape). Route an
+        # empty self-injected override through the same recovery note the primary branch persists.
+        if (
+            isinstance(persist_override, str)
+            and not persist_override.strip()
+            and (resume_pending or is_machinery_display_kind(ctx.persist_user_display_kind))
+        ):
+            persist_override = build_resume_recovery_note(resume_reason, "", interactive=self._resume_note_interactive())
         return persist_override, ctx.persist_user_timestamp
 
     def _native_image_run_message(self):
