@@ -1293,8 +1293,8 @@ def _verify_head_after_pull(
             f"  HEAD is pinned to {pre_pull_sha[:10]} (detached checkout); "
             f"origin/{branch} advanced but the working tree stayed put.")
         print(
-            "  Reattach to the branch and retry: "
-            f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update")
+            "  Reattach to the branch: "
+            f"git -C {_m().PROJECT_ROOT} checkout {branch}")
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         sys.exit(1)
 
@@ -1307,8 +1307,8 @@ def _verify_head_after_pull(
             f"✗ Update pulled origin/{branch}, but the checkout is on "
             f"'{post_pull_branch}' — not claiming success.")
         print(
-            "  Switch to the target branch and retry: "
-            f"git -C {_m().PROJECT_ROOT} checkout {branch} && hermes update")
+            "  Switch to the target branch: "
+            f"git -C {_m().PROJECT_ROOT} checkout {branch}")
         _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         sys.exit(1)
     return post_pull_sha
