@@ -456,7 +456,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     skill_dir, guard = _locate_for_write(name, "edit")
     if guard:
         return guard
-    if protect_err := check_mutable(name, "edit"):
+    if protect_err := check_mutable(skill_dir, name, "edit"):
         return protect_err
     # SKILL.md always exists here (_find_skill requires it), so a blocked scan restores it.
     if guard := guard or _guarded_write(name, skill_dir, skill_dir / "SKILL.md", "edit", "SKILL.md", content):
@@ -479,7 +479,7 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
     skill_dir, guard = _locate_for_write(name, "patch")
     if guard:
         return guard
-    if protect_err := check_mutable(name, "patch"):
+    if protect_err := check_mutable(skill_dir, name, "patch"):
         return protect_err
     target_label = file_path or "SKILL.md"
     if file_path:
@@ -529,7 +529,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         return guard
     if pinned_err := _pinned_guard(name):
         return _err(pinned_err)
-    if protect_err := check_deletable(name):
+    if protect_err := check_deletable(skill_dir, name):
         return protect_err
     absorbed_target = absorbed_into.strip() if isinstance(absorbed_into, str) else ""
     if absorbed_target:
@@ -579,7 +579,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     skill_dir, guard = _locate_for_write(name, "write_file", " Create it first with action='create'.")
     if guard:
         return guard
-    if protect_err := check_mutable(name, "write_file"):
+    if protect_err := check_mutable(skill_dir, name, "write_file"):
         return protect_err
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if guard := err or _guarded_write(name, skill_dir, target, "write_file", file_path, file_content):
@@ -600,7 +600,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     skill_dir, guard = _locate_for_write(name, "remove_file", org_guard=False)
     if guard:
         return guard
-    if protect_err := check_mutable(name, "remove_file"):
+    if protect_err := check_mutable(skill_dir, name, "remove_file"):
         return protect_err
     target, err = _resolve_supporting_file(skill_dir, file_path)
     if err:
