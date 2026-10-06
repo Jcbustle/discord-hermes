@@ -279,6 +279,77 @@ class TestResolveDeliveryTarget:
             "_resolved_from": "explicit",
         }
 
+    def test_explicit_matrix_room_target(self):
+        """deliver: 'matrix:!room:server.org' parses room ID correctly."""
+        job = {"deliver": "matrix:!HLOQ:matrix.org"}
+        assert _resolve_delivery_target(job) == {
+            "platform": "matrix",
+            "chat_id": "!HLOQ:matrix.org",
+            "thread_id": None,
+            "_resolved_from": "explicit",
+        }
+
+    def test_explicit_matrix_room_with_thread(self):
+        """deliver: 'matrix:!room:server.org/$evt' splits room and thread."""
+        job = {"deliver": "matrix:!HLOQ:matrix.org/$thread-evt"}
+        assert _resolve_delivery_target(job) == {
+            "platform": "matrix",
+            "chat_id": "!HLOQ:matrix.org",
+            "thread_id": "$thread-evt",
+            "_resolved_from": "explicit",
+        }
+
+    def test_explicit_matrix_alias_with_thread(self):
+        """deliver: 'matrix:#alias:server.org/$evt' threads via alias."""
+        job = {"deliver": "matrix:#general:matrix.org/$thread-evt"}
+        assert _resolve_delivery_target(job) == {
+            "platform": "matrix",
+            "chat_id": "#general:matrix.org",
+            "thread_id": "$thread-evt",
+            "_resolved_from": "explicit",
+        }
+
+    def test_explicit_matrix_user_dm(self):
+        """deliver: 'matrix:@user:server.org' resolves an MXID DM target."""
+        job = {"deliver": "matrix:@hermes:matrix.org"}
+        assert _resolve_delivery_target(job) == {
+            "platform": "matrix",
+            "chat_id": "@hermes:matrix.org",
+            "thread_id": None,
+            "_resolved_from": "explicit",
+        }
+
+    @pytest.mark.parametrize(
+        ("platform", "home", "cron_thread", "expected_thread"),
+        [
+            ("slack", "U0123456789", None, None),
+            ("yuanbao", "123456", None, None),
+            ("telegram", "-1001234567890:17", "42", "42"),
+            ("matrix", "!room123:example.org/$thread-root", None, None),
+        ],
+    )
+    def test_home_channel_reaches_delivery_as_configured(
+        self, monkeypatch, platform, home, cron_thread, expected_thread
+    ):
+        """Cron passes the configured home chat ID on unchanged. The adapter or sender owns its
+        syntax (a Slack user ID opens a DM, and a Matrix suffix names a thread), and
+        ``TELEGRAM_CRON_THREAD_ID`` keeps precedence for Telegram (#24409)."""
+        from cron import scheduler_delivery
+
+        monkeypatch.setattr(scheduler_delivery, "_get_home_target_chat_id", lambda name: home)
+        monkeypatch.setattr(scheduler_delivery, "_get_config_home_channel", lambda name: None)
+        for name in ("SLACK_HOME_CHANNEL", "TELEGRAM_HOME_CHANNEL", "MATRIX_HOME_ROOM"):
+            monkeypatch.delenv(f"{name}_THREAD_ID", raising=False)
+        if cron_thread:
+            monkeypatch.setenv("TELEGRAM_CRON_THREAD_ID", cron_thread)
+
+        assert _resolve_delivery_target({"deliver": platform}) == {
+            "platform": platform,
+            "chat_id": home,
+            "thread_id": expected_thread,
+            "_resolved_from": "home",
+        }
+
     def test_list_form_deliver_is_normalized(self, monkeypatch):
         """deliver=['telegram'] (Python list) should resolve like 'telegram' string.
 
@@ -2014,12 +2085,15 @@ class TestSendMediaTimeoutCancelsFuture:
         loop = MagicMock()
         job = {"id": "media-timeout"}
 
+        in_flight = []
         with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
             # Should not raise — the except Exception clause swallows the timeout
-            _send_media_via_adapter(adapter, "chat-1", media_files, None, loop, job)
+            _send_media_via_adapter(adapter, "chat-1", media_files, None, loop, job, in_flight=in_flight)
 
         # 1. The timed-out future was cancelled (the bug fix)
         assert timeout_cancel_calls == [True], "future.cancel() must fire on TimeoutError"
+        # The timed-out send may still complete, so the caller must not send the file again.
+        assert in_flight == [str(slow.resolve())]
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == str(fast.resolve())
@@ -2085,7 +2159,7 @@ class TestCronDeliveryMirror:
         turn (with a [Cron delivery: ...] label), NOT assistant — an
         assistant-role mirror lands as assistant->assistant after the agent's
         last turn and breaks strict alternation on non-Anthropic providers."""
-        from cron.scheduler_delivery import _maybe_mirror_cron_delivery
+        from cron.scheduler_delivery_continuation import _maybe_mirror_cron_delivery
 
         with patch("gateway.mirror.mirror_to_session", return_value=True) as m:
             _maybe_mirror_cron_delivery(
@@ -2139,9 +2213,11 @@ class TestCronDeliveryMirror:
     def test_seed_thread_session_creates_session_and_mirrors(self):
         """Seeding a freshly-opened thread creates the thread-keyed session via
         the adapter's live store and appends the brief via mirror_to_session."""
-        from cron.scheduler_delivery import _seed_cron_thread_session
+        from cron.scheduler_delivery_continuation import _seed_cron_thread_session
+        from gateway.config import GatewayConfig
 
         store = MagicMock()
+        store.config = GatewayConfig()
         adapter = MagicMock()
         adapter._session_store = store
 
@@ -2223,7 +2299,7 @@ class TestCronContinuableSurfaceInChannel:
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("cron.scheduler_delivery._open_continuable_cron_thread") as open_thread_mock, \
+             patch("cron.scheduler_delivery_continuation._open_continuable_cron_thread") as open_thread_mock, \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
              patch("gateway.mirror.mirror_to_session", return_value=mirror_ok) as mirror_mock:
             _deliver_result(
@@ -2268,7 +2344,7 @@ class TestCronContinuableSurfaceInChannel:
         """The whole point: the flat session the seed CREATES must be keyed
         identically to what a plain inbound channel reply resolves to. Assert
         the invariant directly via build_session_key, not just call args."""
-        from cron.scheduler_delivery import _seed_cron_channel_session
+        from cron.scheduler_delivery_continuation import _seed_cron_channel_session
         from gateway.session import build_session_key, SessionSource
         from gateway.config import Platform
 
@@ -2313,7 +2389,7 @@ class TestCronContinuableSurfaceInChannel:
         from cron.scheduler import _deliver_result  # noqa: F401 (driven via helper)
 
         adapter = self._slack_adapter(supports_inchannel=True)
-        with patch("cron.scheduler_delivery._seed_cron_channel_session", return_value=True) as seed_mock:
+        with patch("cron.scheduler_delivery_continuation._seed_cron_channel_session", return_value=True) as seed_mock:
             self._run_inchannel_delivery(
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False,
@@ -2349,7 +2425,7 @@ class TestCronContinuableSurfaceInChannel:
             "thread_id": "1787188000.000100",
         }
         with patch("gateway.delivery.DeliveryRouter", _SpyRouter), \
-             patch("cron.scheduler_delivery._seed_cron_channel_session", return_value=True) as seed_mock:
+             patch("cron.scheduler_delivery_continuation._seed_cron_channel_session", return_value=True) as seed_mock:
             self._run_inchannel_delivery(
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False, origin=origin_with_thread,
@@ -2389,7 +2465,7 @@ class TestCronContinuableSurfaceInChannel:
             "scope_id": "T0AAAA111",
         }
         with patch("gateway.delivery.DeliveryRouter", _SpyRouter), \
-             patch("cron.scheduler_delivery._seed_cron_channel_session", return_value=True):
+             patch("cron.scheduler_delivery_continuation._seed_cron_channel_session", return_value=True):
             self._run_inchannel_delivery(
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False, origin=scoped_origin,
@@ -2415,7 +2491,7 @@ class TestCronContinuableSurfaceInChannel:
 
         adapter = self._slack_adapter(supports_inchannel=True)
         with patch("gateway.delivery.DeliveryRouter", _SpyRouter), \
-             patch("cron.scheduler_delivery._seed_cron_channel_session", return_value=True):
+             patch("cron.scheduler_delivery_continuation._seed_cron_channel_session", return_value=True):
             self._run_inchannel_delivery(
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False,
@@ -2445,7 +2521,7 @@ class TestCronContinuableSurfaceInChannel:
         assert not callable(
             getattr(adapter, "supports_inchannel_continuable_for_platform", None)
         )
-        with patch("cron.scheduler_delivery._seed_cron_channel_session") as seed_mock:
+        with patch("cron.scheduler_delivery_continuation._seed_cron_channel_session") as seed_mock:
             self._run_inchannel_delivery(
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False,
@@ -2467,7 +2543,7 @@ class TestCronContinuableSurfaceInChannel:
         mixed user_ids) find_session_by_origin's multi-candidate bail-out
         returned None, silently dropping the brief. The seed must mirror into
         the EXACT session row it just created, no rediscovery."""
-        from cron.scheduler_delivery import _seed_cron_channel_session
+        from cron.scheduler_delivery_continuation import _seed_cron_channel_session
 
         store = MagicMock()
         created = MagicMock()
@@ -2493,8 +2569,8 @@ class TestCronContinuableSurfaceInChannel:
         never seeded, so the agent had no idea about its own brief. The flat
         delivery's message_id must anchor a companion thread-surface seed."""
         adapter = self._slack_adapter(supports_inchannel=True)
-        with patch("cron.scheduler_delivery._seed_cron_channel_session", return_value=True), \
-             patch("cron.scheduler_delivery._seed_cron_thread_session") as thread_seed_mock:
+        with patch("cron.scheduler_delivery_continuation._seed_cron_channel_session", return_value=True), \
+             patch("cron.scheduler_delivery_continuation._seed_cron_thread_session") as thread_seed_mock:
             self._run_inchannel_delivery(
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False,
@@ -2541,7 +2617,13 @@ class TestMultiTargetDeliveryContinuesOnFailure:
             fail_future.result.side_effect = ConnectionError("SMTP connection refused")
             ok_future = MagicMock()
             ok_future.result.return_value = {"success": True}
-            mock_pool.submit.side_effect = [fail_future, ok_future]
+            futures = iter([fail_future, ok_future])
+
+            def submit(context_run, async_run, coro):
+                coro.close()
+                return next(futures)
+
+            mock_pool.submit.side_effect = submit
 
             result = _deliver_result(job, "Report content")
 
@@ -2570,7 +2652,11 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
             fail_future = MagicMock()
             fail_future.result.side_effect = ConnectionError("connection refused")
-            mock_pool.submit.return_value = fail_future
+            def submit(context_run, async_run, coro):
+                coro.close()
+                return fail_future
+
+            mock_pool.submit.side_effect = submit
 
             result = _deliver_result(job, "Report content")
 
