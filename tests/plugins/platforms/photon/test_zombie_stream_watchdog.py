@@ -9,9 +9,11 @@ The salvaged design has two layers:
 1. Sidecar (node): ``stream-staleness.mjs`` decision rules + a watchdog in
    ``index.mjs`` that tracks the iterator's last yield, probes only after a
    conservative silence threshold, and classifies degraded ONLY when a probe
-   proves connectivity while the stream is silent (never on silence alone,
-   never on an inconclusive probe). Degraded feeds the existing exit-75
-   restart path and the ``staleness`` block on ``/healthz``.
+   proves connectivity while the stream is silent AND an outbound send is
+   still awaiting its stream echo past a grace period (never on silence
+   alone, never on an inconclusive probe, never on silence+alive alone —
+   #124010). Degraded feeds the existing exit-75 restart path and the
+   ``staleness`` block on ``/healthz``.
 2. Adapter (python): ``_monitor_sidecar_health`` surfaces the new staleness
    fields; ``_probe_once`` has strict tri-state semantics (alive / hung /
    inconclusive).
@@ -122,32 +124,60 @@ def test_should_probe_requires_silence_past_threshold_and_cooldown() -> None:
     assert out["watchdogDisabledNegative"] is False
 
 def test_zombie_requires_probe_proven_connectivity_never_silence_alone() -> None:
-    """The core conservatism rule: shared lines can be quiet for hours, so a
-    zombie is declared only when the stream is silent past threshold AND a
-    probe PROVED the wire works (stream dead, channel alive)."""
+    """The core conservatism rule (#124010): shared lines can be quiet for
+    hours — and since v2026.9.24 the probe id is a valid UUID, so a quiet
+    healthy dedicated line ALSO sits at 'silent + probe alive' indefinitely.
+    A zombie is declared only when the stream is silent past threshold AND a
+    probe PROVED the wire works AND an outbound send is still awaiting its
+    stream echo (the iterator yields our own echoes, so a missing echo is the
+    only positive proof the stream itself is deaf)."""
     out = _run_staleness_harness(
         """
         const MIN10 = 10 * 60 * 1000;
         const alive = { alive: true };
         const inconclusive = { alive: false };
         const results = {
-          silentAndProbeAlive: isZombieSuspect(MIN10 * 2, MIN10, alive),
-          silentButProbeInconclusive: isZombieSuspect(MIN10 * 2, MIN10, inconclusive),
-          silentNoProbe: isZombieSuspect(MIN10 * 2, MIN10, null),
-          hoursOfSilenceInconclusive: isZombieSuspect(MIN10 * 36, MIN10, inconclusive),
-          notSilentEnough: isZombieSuspect(MIN10 - 1, MIN10, alive),
-          disabled: isZombieSuspect(MIN10 * 2, 0, alive),
+          silentAliveOverdueEcho: isZombieSuspect(MIN10 * 2, MIN10, alive, true),
+          silentAliveNoEcho: isZombieSuspect(MIN10 * 2, MIN10, alive, false),
+          silentAliveEchoDefaultsOff: isZombieSuspect(MIN10 * 2, MIN10, alive),
+          silentInconclusiveOverdueEcho: isZombieSuspect(MIN10 * 2, MIN10, inconclusive, true),
+          silentNoProbe: isZombieSuspect(MIN10 * 2, MIN10, null, true),
+          hoursSilenceAliveNoEcho: isZombieSuspect(MIN10 * 36, MIN10, alive, false),
+          notSilentEnough: isZombieSuspect(MIN10 - 1, MIN10, alive, true),
+          disabled: isZombieSuspect(MIN10 * 2, 0, alive, true),
         };
         process.stdout.write(JSON.stringify(results));
         """
     )
-    assert out["silentAndProbeAlive"] is True
-    # Silence alone — even 6 hours of it — is NEVER a zombie verdict.
-    assert out["silentButProbeInconclusive"] is False
+    assert out["silentAliveOverdueEcho"] is True
+    # Silence + alive probe, without echo evidence, is NEVER a zombie verdict.
+    assert out["silentAliveNoEcho"] is False
+    assert out["silentAliveEchoDefaultsOff"] is False
+    assert out["hoursSilenceAliveNoEcho"] is False
+    # An overdue echo with no proven connectivity is not evidence either.
+    assert out["silentInconclusiveOverdueEcho"] is False
     assert out["silentNoProbe"] is False
-    assert out["hoursOfSilenceInconclusive"] is False
     assert out["notSilentEnough"] is False
     assert out["disabled"] is False
+
+def test_quiet_dedicated_line_without_echo_evidence_is_not_a_zombie() -> None:
+    """Regression for #124010: a healthy but quiet dedicated line sits at
+    exactly 'silent past threshold + probe alive' for hours — with no outbound
+    send awaiting its stream echo that state is normal, not a half-open
+    stream, so the watchdog must leave it alone."""
+    out = _run_staleness_harness(
+        """
+        const MIN10 = 10 * 60 * 1000;
+        const alive = { alive: true };
+        const results = {
+          quietNoEchoEvidence: isZombieSuspect(MIN10 * 2, MIN10, alive, false),
+          quietOverdueEcho: isZombieSuspect(MIN10 * 2, MIN10, alive, true),
+        };
+        process.stdout.write(JSON.stringify(results));
+        """
+    )
+    assert out["quietNoEchoEvidence"] is False
+    assert out["quietOverdueEcho"] is True
 
 # -- Adapter surfacing of the new /healthz staleness fields ------------------
 
@@ -235,3 +265,114 @@ async def test_inconclusive_probes_never_accumulate_toward_respawn(
             adapter._probe_failures += 1
 
     assert adapter._probe_failures == 0
+
+
+# -- Echo-gate wiring (#124010 review) ---------------------------------------
+
+
+def _run_gate_harness(script: str) -> Dict[str, Any]:
+    harness = (
+        "import { armOutboundAttempt, clearEchoOnYield, withEchoGate } "
+        f"from {json.dumps(_MODULE.as_uri())};\n"
+        + script
+    )
+    run = subprocess.run(
+        ["node", "--input-type=module", "-e", harness],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+def test_echo_gate_arms_before_the_await_and_stays_cleared() -> None:
+    """#124010 review scenario B: our own echo is consumed on the iterator while the
+    send is still in flight — the gate must stay CLEARED after the send resolves. The
+    old wiring (arm after the await) re-armed it and restarted a healthy sidecar.
+    Scenario A guard: an echo that never arrives is still overdue past the grace."""
+    out = _run_gate_harness(
+        """
+        const a = { lastInboundAt: 0, zombieSuspected: false, lastOutboundAt: 0, echoPending: false };
+        let resolveA;
+        const pendingA = withEchoGate(a, () => new Promise((r) => { resolveA = r; }), 2000);
+        const armedDuringSend = a.echoPending === true && a.lastOutboundAt === 2000;
+        resolveA({ id: "a" });
+        await pendingA;
+        const overdueWhenEchoNeverArrives =
+          a.echoPending && (2500 - a.lastOutboundAt) >= 500;
+
+        const b = { lastInboundAt: 0, zombieSuspected: false, lastOutboundAt: 0, echoPending: false };
+        let resolveB;
+        const pendingB = withEchoGate(b, () => new Promise((r) => { resolveB = r; }), 4000);
+        clearEchoOnYield(b, 4100);  // the echo arrived while the send was in flight
+        resolveB({ id: "b" });
+        await pendingB;
+        const clearedAfterMidSendEcho = b.echoPending === false;
+        const overdueAfterMidSendEcho =
+          b.echoPending && (5000 - b.lastOutboundAt) >= 500;
+
+        process.stdout.write(JSON.stringify({
+          armedDuringSend,
+          overdueWhenEchoNeverArrives,
+          clearedAfterMidSendEcho,
+          overdueAfterMidSendEcho,
+        }));
+        """
+    )
+    assert out["armedDuringSend"] is True
+    assert out["overdueWhenEchoNeverArrives"] is True
+    assert out["clearedAfterMidSendEcho"] is True
+    assert out["overdueAfterMidSendEcho"] is False
+
+
+def test_echo_gate_failed_send_restores_the_previous_gate() -> None:
+    """A send that throws posted no bubble: the attempt must not leave the gate armed,
+    and a still-pending earlier echo is not swallowed."""
+    out = _run_gate_harness(
+        """
+        const prior = { lastInboundAt: 0, zombieSuspected: false, lastOutboundAt: 123, echoPending: true };
+        let threwA = false;
+        try {
+          await withEchoGate(prior, async () => { throw new Error("boom"); }, 6000);
+        } catch (e) { threwA = true; }
+        const priorRestored = prior.echoPending === true && prior.lastOutboundAt === 123;
+
+        const fresh = { lastInboundAt: 0, zombieSuspected: false, lastOutboundAt: 0, echoPending: false };
+        let threwB = false;
+        try {
+          await withEchoGate(fresh, async () => { throw new Error("boom"); }, 7000);
+        } catch (e) { threwB = true; }
+        const failureLeavesGateClosed = fresh.echoPending === false && fresh.lastOutboundAt === 0;
+
+        process.stdout.write(JSON.stringify({
+          threwA, priorRestored, threwB, failureLeavesGateClosed,
+        }));
+        """
+    )
+    assert out["threwA"] is True
+    assert out["priorRestored"] is True
+    assert out["threwB"] is True
+    assert out["failureLeavesGateClosed"] is True
+
+
+def test_sidecar_echoing_sends_all_go_through_the_gate() -> None:
+    """Every echoing send in index.mjs must run through withEchoGate (armed before the
+    await); the attachment caption bubble used to be skipped entirely (P2). The typing
+    indicator does not echo and stays bare; index.mjs never arms the gate directly."""
+    src = _MODULE.parent.joinpath("index.mjs").read_text(encoding="utf-8")
+    assert "echoPending =" not in src, "the gate helpers are the only armer/clearer"
+    lines = src.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if (
+            stripped.startswith("//")
+            or "space.send(" not in line
+            or "spectrumTyping" in line
+        ):
+            continue
+        window = "\n".join(lines[max(0, index - 2): index + 2])
+        assert "withEchoGate(" in window, (
+            f"ungated echoing send near line {index + 1}:\n{window}"
+        )
