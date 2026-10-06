@@ -772,3 +772,44 @@ class TestBackslashDoublingDrift:
         result, count, strategy, err = self.replace(content, old, new)
         assert count == 0
         assert err is not None and "apostrophe" in err
+
+
+class TestEdittoolShapeSingleLineFailLoud:
+    """Edit-tool shape audit (#111116), smallest slice: single-line wrong
+    anchors must fail loud, not apply via similarity drift."""
+
+    def test_wrong_token_single_line_refused(self):
+        from tools.fuzzy_match import fuzzy_find_and_replace
+
+        content = "def f(v):\n    return value.strip()\n"
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, "    return value.trim()", "    return value.fixed()"
+        )
+        assert count == 0, f"wrong anchor applied via {strategy}: {new!r}"
+        assert err is not None and "Could not find" in err
+        assert content == "def f(v):\n    return value.strip()\n"
+
+    def test_exact_single_line_still_applies(self):
+        from tools.fuzzy_match import fuzzy_find_and_replace
+
+        content = "def f(v):\n    return value.strip()\n"
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, "    return value.strip()", "    return value.fixed()"
+        )
+        assert count == 1 and err is None
+        assert "return value.fixed()" in new
+
+    def test_wrong_token_single_line_trailing_newline_refused(self):
+        from tools.fuzzy_match import fuzzy_find_and_replace
+
+        content = "def f(v):\n    return value.strip()\n"
+        for old in (
+            "    return value.trim()\n",
+            "    return value.trim()\r\n",
+        ):
+            new, count, strategy, err = fuzzy_find_and_replace(
+                content, old, "    return value.fixed()"
+            )
+            assert count == 0, f"wrong anchor via {strategy} for {old!r}: {new!r}"
+            assert err is not None and "Could not find" in err
+            assert new == content

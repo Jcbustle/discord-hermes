@@ -264,6 +264,13 @@ def _strategy_context_aware(content: str, pattern: str) -> list[Span]:
     pattern_lines = pattern.split('\n')
     content_lines = content.split('\n')
     n = len(pattern_lines)
+    if len(pattern.strip().split('\n')) == 1:
+        # ponytail: single-line similarity has no block context; precise
+        # strategies 1-7 already cover whitespace/indent/unicode drift.
+        # Refuse here so wrong-token anchors (trim vs strip) fail loud.
+        # A trailing \n / \r\n must not count as block context.
+        # Upgrade path: token-aware similarity if single-line typos need it.
+        return []
     if n > len(content_lines):
         return []
     first_pat = pattern_lines[0].strip()
