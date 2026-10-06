@@ -20,6 +20,14 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from hermes_cli import setup_platforms  # noqa: F401 — resolved lazily by siblings through the facade
+from hermes_cli.gateway_generation_guards import (  # noqa: F401 — resolved lazily by siblings through the facade
+    _generation_launcher_in_plist,
+    _generation_tree_in_exec_lines,
+    _refuse_generation_launcher_service_write,
+    _refuse_temp_home_service_write,
+    _service_install_root,
+    _temp_home_in_service_definition,
+)
 
 # UV's bundled Python ships a minimal PATH; ensure launchctl/systemctl are discoverable.
 if os.name == "posix":
@@ -3223,7 +3231,7 @@ def _prepare_service_launcher(*, system: bool = False, run_as_user: str | None =
     from hermes_cli._launchers import ENTRY_POINTS, ensure_install_launchers, resolve_store_python
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
-    root, home = PROJECT_ROOT, get_hermes_home()
+    root, home = _service_install_root(PROJECT_ROOT), get_hermes_home()
     owner = None
     if system:
         username, _group, home_dir, uid = _system_service_identity(run_as_user)
@@ -3255,8 +3263,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
 
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
-    project_root = PROJECT_ROOT
-
+    project_root = _service_install_root(PROJECT_ROOT)
     path_entries = _build_service_path_dirs()
     if not system:
         # System units add managed Node once the TARGET user's home is known (not the sudo caller's).
@@ -3398,40 +3405,6 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     return norm(installed) == norm(expected)
 
 
-def _temp_home_in_service_definition(definition: str) -> str | None:
-    """Temp-dir HERMES_HOME baked into a systemd unit / launchd plist, or None. A temp home means a
-    test/E2E harness generated it; installing it leaves the gateway "running" but deaf to every platform."""
-    import re
-    import tempfile
-    candidates = re.findall(r'HERMES_HOME=([^"\n]+)', definition)
-    candidates += re.findall(r"<key>HERMES_HOME</key>\s*<string>(.*?)</string>", definition, flags=re.S)
-    temp_roots = {
-        Path(tempfile.gettempdir()).resolve(),
-        Path("/tmp"), Path("/var/tmp"), Path("/private/tmp"), Path("/private/var/tmp"),  # no-tmp: ok — detects a temp HERMES_HOME in service definitions
-    }
-    for raw in candidates:
-        try:
-            resolved = Path(raw.strip().strip('"')).resolve()
-        except (OSError, ValueError):
-            continue
-        if any(resolved == root or root in resolved.parents for root in temp_roots):
-            return raw.strip()
-    return None
-
-
-def _refuse_temp_home_service_write(definition: str, kind: str) -> bool:
-    """Refuse (with guidance) when a service definition carries a temp HERMES_HOME."""
-    temp_home = _temp_home_in_service_definition(definition)
-    if temp_home is None:
-        return False
-    print(f"✗ Refusing to write the gateway {kind}: HERMES_HOME resolves to a temporary directory ({temp_home}).")
-    print(
-        "  This usually means a test/E2E environment exported HERMES_HOME. "
-        "Unset it (or run from a clean shell) and retry."
-    )
-    return True
-
-
 def _retire_hermes_replace_dropin(system: bool = False) -> bool:
     """Remove only the legacy ``--replace`` drop-in written by Hermes."""
     unit_path = get_systemd_unit_path(system=system)
@@ -3472,6 +3445,9 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
 
     # Structural variant: refuse ANY temp-dir HERMES_HOME (manual E2E homes lack the pytest markers).
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
+        return False
+
+    if _refuse_generation_launcher_service_write(new_unit, "systemd unit"):
         return False
 
     _prepare_service_launcher(system=system, run_as_user=expected_user)
@@ -3692,6 +3668,8 @@ def systemd_install(
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     new_unit = generate_systemd_unit(system=system, run_as_user=run_as_user)
     if _refuse_temp_home_service_write(new_unit, "systemd unit"):
+        return
+    if _refuse_generation_launcher_service_write(new_unit, "systemd unit"):
         return
     print(f"Installing {scope_label} systemd service to: {unit_path}")
     _prepare_service_launcher(system=system, run_as_user=run_as_user)
