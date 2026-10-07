@@ -5,6 +5,7 @@ import subprocess
 from hermes_cli.version_info import (
     VersionInfo,
     _derived_version,
+    _newest_calver_tag,
     _reset_version_info_cache,
     _resolve_stamp_file,
     _stamp_version_info,
@@ -213,6 +214,89 @@ def test_get_version_info_takes_the_version_a_calver_only_release_shipped(tmp_pa
     assert info.base_version == "0.21.4"
     assert info.distance == 1
     assert info.derived_version == f"0.21.4+1.g{git('rev-parse', '--short=7', 'HEAD')}"
+
+
+def _release_line_repo(tmp_path):
+    """A tree holding THREE releases, where the older tag is the nearer one.
+
+    Release tags are cut on side lines and merged back, so the newest release a
+    tree contains is not always the tag closest to HEAD. Here ``v2026.1.1``
+    (0.1.0) sits 2 commits back and ``v2026.1.2`` (0.1.1) sits 6 back, yet both
+    are ancestors of HEAD: the tree ships 0.1.1 over the nearer tag's 0.1.0.
+    A same-day patch release, ``v2026.1.2.2`` (0.1.2), is the newest release in
+    the tree -- its tag sorts after the base tag lexicographically, on the same
+    calendar day.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=repo, text=True, capture_output=True, check=True,
+            env={"HOME": str(tmp_path), "PATH": __import__("os").environ["PATH"]},
+        )
+        return result.stdout.strip()
+
+    def pyproject(version: str) -> None:
+        (repo / "pyproject.toml").write_text(
+            f'[project]\nname = "hermes-agent"\nversion = "{version}"\n', encoding="utf-8"
+        )
+        git("add", "pyproject.toml")
+
+    git("init", "-q")
+    git("config", "user.name", "Hermes Test")
+    git("config", "user.email", "hermes@example.invalid")
+    pyproject("0.0.0")
+    git("commit", "-qm", "root")
+    git("checkout", "-q", "-b", "release-line")
+    pyproject("0.1.1")
+    git("commit", "-qam", "newer release")
+    git("tag", "v2026.1.2")
+    # Same-day patch release: a later tag on the SAME calendar day. The tag
+    # list is lexicographic and the base tag comes first, so a strict ``>`` on
+    # (year, month, day) alone keeps the base tag and under-reports the tree.
+    pyproject("0.1.2")
+    git("commit", "-qam", "same-day patch")
+    git("tag", "v2026.1.2.2")
+    git("checkout", "-q", "-")
+    for index in range(4):
+        (repo / f"m{index}.txt").write_text(f"m{index}\n", encoding="utf-8")
+        git("add", f"m{index}.txt")
+        git("commit", "-qm", f"m{index}")
+    pyproject("0.1.0")
+    git("commit", "-qam", "older release")
+    git("tag", "v2026.1.1")
+    # The two release lines touch the same version line; take the newer side's
+    # content so the merge lands the release the tree actually ships.
+    subprocess.run(
+        ["git", "merge", "--no-ff", "release-line", "-m", "merge release line"],
+        cwd=repo, text=True, capture_output=True,
+    )
+    pyproject("0.1.2")
+    git("commit", "-qm", "merge release line")
+    return repo, git
+
+
+def test_requires_hermes_gate_admits_the_newest_release_the_tree_contains(tmp_path, monkeypatch):
+    """A plugin the running tree's newest release satisfies must not be gated out.
+
+    The base version is the newest release in the running code, not the tag
+    nearest HEAD: on a history that merges release lines those differ, and a
+    gate judged against the older one silently skips plugins the code supports.
+    """
+    from hermes_cli.plugins_manifest import requires_hermes_error
+
+    repo, _git = _release_line_repo(tmp_path)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_stamp_file", lambda: None)
+    monkeypatch.setattr("hermes_cli.version_info._resolve_repo_dir", lambda: repo)
+    _reset_version_info_cache()
+
+    # Same-day patch tags order by their suffix, not by `git tag`'s
+    # lexicographic order (which puts the base tag first).
+    assert _newest_calver_tag(repo) == "v2026.1.2.2"
+    # The gate admits what the tree can run, and still refuses what it cannot.
+    assert requires_hermes_error({"requires_hermes": ">=0.1.2"}) is None
+    assert requires_hermes_error({"requires_hermes": ">=9.9.9"}) is not None
 
 
 def test_resolve_stamp_file_honors_install_root(tmp_path, monkeypatch):
