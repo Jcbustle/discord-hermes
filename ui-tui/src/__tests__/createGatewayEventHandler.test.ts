@@ -571,6 +571,53 @@ describe('createGatewayEventHandler', () => {
     }
   })
 
+  it('surfaces streaming reasoning deltas to the view layer while per-turn peek is active (#121979)', () => {
+    vi.useFakeTimers()
+    patchUiState({ reasoningPeek: true, showReasoning: false })
+    const appended: Msg[] = []
+    const streamed = 'peeked reasoning chunk'
+
+    try {
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: { text: streamed }, type: 'reasoning.delta' } as any)
+      vi.runOnlyPendingTimers()
+
+      // The view layer must receive the live reasoning even though the
+      // session-wide show_reasoning toggle is off.
+      expect(turnController.reasoningText).toBe(streamed)
+      expect(getTurnState().reasoning).toBe(streamed)
+      expect(getTurnState().streamSegments.some(msg => msg.thinking === streamed)).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('withdraws peek reasoning from the transcript and resets the peek when the turn settles (#121979)', () => {
+    vi.useFakeTimers()
+    patchUiState({ reasoningPeek: true, showReasoning: false })
+    const appended: Msg[] = []
+    const streamed = 'ephemeral peek reasoning'
+
+    try {
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: { text: streamed }, type: 'reasoning.delta' } as any)
+      vi.runOnlyPendingTimers()
+      expect(getTurnState().reasoning).toBe(streamed)
+
+      onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
+
+      // Peek reasoning is ephemeral: nothing thinking-bearing is committed,
+      // and the per-turn peek flag resets with the settled turn.
+      expect(appended.map(msg => msg.thinking).filter(Boolean)).toEqual([])
+      expect(appended[appended.length - 1]).toMatchObject({ role: 'assistant', text: 'final answer' })
+      expect(getUiState().reasoningPeek).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('ignores fallback reasoning.available when streamed reasoning already exists', () => {
     const appended: Msg[] = []
     const streamed = 'short streamed reasoning'
@@ -2207,6 +2254,16 @@ describe('createGatewayEventHandler', () => {
         vi.runAllTimers()
         vi.useRealTimers()
       }
+    })
+
+    it('fullReset() clears an armed reasoning peek (no cross-session leak)', () => {
+      patchUiState({ reasoningPeek: true, showReasoning: false })
+
+      // Session boundary: a peek armed in session A must not govern session
+      // B's first turn (#121979 review).
+      turnController.fullReset()
+
+      expect(getUiState().reasoningPeek).toBe(false)
     })
 
     it('ignores a notification.show with no text', () => {
