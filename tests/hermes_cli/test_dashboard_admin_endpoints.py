@@ -363,7 +363,14 @@ class TestPairingEndpoints:
 class TestWebhookEndpoints:
     @pytest.fixture(autouse=True)
     def _setup(self, _isolate_hermes_home):
+        import hermes_cli.web_server as web_server
+
+        # Per-profile restart state is module-level: a fake restart child left by one test
+        # would be reused by the next (the old single-slot state was cleared via _ACTION_PROCS).
+        web_server._GATEWAY_RESTARTS_BY_PROFILE.clear()
         self.client, _ = _client()
+        yield
+        web_server._GATEWAY_RESTARTS_BY_PROFILE.clear()
 
 
     def test_create_webhook_persists_script(self):
@@ -441,6 +448,13 @@ class TestWebhookEndpoints:
                 return None
 
         monkeypatch.setitem(_web_server_gateway._ACTION_PROCS, "gateway-restart", FakeRunningProc())
+        # _spawn_hermes_action always records the command next to the process; a live child with no
+        # recorded command is not provably this restart's own and is deliberately not reused.
+        monkeypatch.setitem(
+            _web_server_gateway._ACTION_COMMANDS,
+            "gateway-restart",
+            ("-p", "default", "gateway", "restart"),
+        )
 
         def fail_spawn_action(subcommand, name):
             raise AssertionError("must not spawn a second concurrent restart")

@@ -18,12 +18,12 @@ import hermes_cli.web_server_gateway as _web_server_gateway
 
 @pytest.fixture(autouse=True)
 def reset_restart_cooldown():
-    """Keep the module-level cooldown state out of neighbouring tests."""
+    """Keep the module-level per-profile cooldown state out of neighbouring tests."""
     import hermes_cli.web_server as web_server
 
-    web_server._LAST_GATEWAY_RESTART = None
+    web_server._GATEWAY_RESTARTS_BY_PROFILE.clear()
     yield
-    web_server._LAST_GATEWAY_RESTART = None
+    web_server._GATEWAY_RESTARTS_BY_PROFILE.clear()
 
 
 def _exited_proc(pid: int = 4242) -> MagicMock:
@@ -191,10 +191,8 @@ class TestExistingBehaviourIsPreserved:
         live.pid = 7
 
         with patch(
-            "hermes_cli.web_server_gateway._ACTION_PROCS", {"gateway-restart": live}
-        ), patch(
-            "hermes_cli.web_server_gateway._ACTION_COMMANDS",
-            {"gateway-restart": ("gateway", "restart")},
+            "hermes_cli.web_server._GATEWAY_RESTARTS_BY_PROFILE",
+            {"": (50.0, live, ("gateway", "restart"))},
         ), patch(
             "hermes_cli.gateway._reap_unsupervised_gateway_orphans"
         ):
@@ -204,26 +202,76 @@ class TestExistingBehaviourIsPreserved:
         assert reused is True
         mock_spawn.assert_not_called()
 
-    @patch(
-        "hermes_cli.web_server_gateway._gateway_subcommand",
-        return_value=["gateway", "restart"],
-    )
+
+class TestCooldownIsKeyedByTheRestartedGateway:
+    """The per-profile map is keyed by the gateway the child restarts, not by the request."""
+
     @patch("hermes_cli.web_server_gateway._spawn_hermes_action")
-    def test_live_child_for_another_profile_still_raises(self, mock_spawn, mock_subcmd):
+    @patch("hermes_cli.web_server_gateway._ACTION_PROCS", {})
+    def test_requests_resolving_to_the_same_gateway_share_one_cooldown(self, mock_spawn):
+        """A multiplexer-served profile resolves to ``-p default``; so does the empty request."""
+        from hermes_cli.web_server import _spawn_gateway_restart
+
+        mock_spawn.return_value = _exited_proc()
+        resolved = ["-p", "default", "gateway", "restart"]
+
+        with patch("hermes_cli.gateway._reap_unsupervised_gateway_orphans"), patch(
+            "hermes_cli.web_server.time.monotonic", side_effect=[100.0, 101.0]
+        ), patch(
+            "hermes_cli.web_server_gateway._gateway_subcommand", return_value=resolved
+        ):
+            _, first_reused = _spawn_gateway_restart(profile="coder")
+            _, second_reused = _spawn_gateway_restart()
+
+        assert mock_spawn.call_count == 1
+        assert first_reused is False
+        assert second_reused is True
+
+    @patch("hermes_cli.web_server_gateway._spawn_hermes_action")
+    def test_live_child_without_a_recorded_command_is_not_reused(self, mock_spawn):
+        """No recorded argv proves nothing about whose restart it is."""
         from hermes_cli.web_server import _spawn_gateway_restart
 
         live = MagicMock(spec=subprocess.Popen)
         live.poll.return_value = None
+        live.pid = 9
+        mock_spawn.return_value = _exited_proc(10)
 
         with patch(
             "hermes_cli.web_server_gateway._ACTION_PROCS", {"gateway-restart": live}
+        ), patch("hermes_cli.web_server_gateway._ACTION_COMMANDS", {}), patch(
+            "hermes_cli.gateway._reap_unsupervised_gateway_orphans"
+        ), patch(
+            "hermes_cli.web_server_gateway._gateway_subcommand",
+            return_value=["gateway", "restart"],
+        ):
+            proc, reused = _spawn_gateway_restart()
+
+        assert reused is False
+        assert proc is not live
+        mock_spawn.assert_called_once()
+
+    @patch("hermes_cli.web_server_gateway._spawn_hermes_action")
+    def test_live_child_for_another_profile_is_never_handed_back(self, mock_spawn):
+        """The cross-profile no-silent-reuse invariant, pinned for the recorded-command path."""
+        from hermes_cli.web_server import _spawn_gateway_restart
+
+        other = MagicMock(spec=subprocess.Popen)
+        other.poll.return_value = None
+        other.pid = 11
+        mock_spawn.return_value = _exited_proc(12)
+
+        with patch(
+            "hermes_cli.web_server_gateway._ACTION_PROCS", {"gateway-restart": other}
         ), patch(
             "hermes_cli.web_server_gateway._ACTION_COMMANDS",
             {"gateway-restart": ("-p", "coder", "gateway", "restart")},
-        ), patch(
-            "hermes_cli.gateway._reap_unsupervised_gateway_orphans"
+        ), patch("hermes_cli.gateway._reap_unsupervised_gateway_orphans"), patch(
+            "hermes_cli.web_server_gateway._gateway_subcommand",
+            return_value=["-p", "default", "gateway", "restart"],
         ):
-            with pytest.raises(RuntimeError, match="another profile"):
-                _spawn_gateway_restart()
+            proc, reused = _spawn_gateway_restart()
 
-        mock_spawn.assert_not_called()
+        assert reused is False
+        assert proc is not other
+        mock_spawn.assert_called_once()
