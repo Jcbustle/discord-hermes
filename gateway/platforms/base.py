@@ -4468,6 +4468,15 @@ class BasePlatformAdapter(ABC):
         # A scheduled heartbeat is proactive work: no typing indicator until it has something to say.
         if not getattr(self.config, "typing_indicator", True) or getattr(event, "_heartbeat_session_id", None):
             return None
+        # #119143: a gateway-managed adapter holds the indicator silent from spawn until the
+        # runner signals agent-run readiness (``resume_typing_for_chat`` right before
+        # ``_run_agent``), so receiving, batching and inbound enrichment (STT/vision) stay
+        # invisible; a turn that never starts an agent run never signals and shows nothing.
+        # The pause cannot leak: ``_stop_typing_refresh`` discards it at turn exit. A bare
+        # adapter (no runner) has nothing to signal the readiness protocol, so it keeps the
+        # unconditional refresh contract — handlers that never signal are not starved.
+        if self.gateway_runner is not None:
+            self.pause_typing_for_chat(event.source.chat_id)
         kwargs: Dict[str, Any] = {"metadata": metadata}
         if self._accepts_kwarg(self._keep_typing, "stop_event", var_kw=False, unknown=True):
             kwargs["stop_event"] = interrupt_event

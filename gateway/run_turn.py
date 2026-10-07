@@ -2194,6 +2194,15 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            # #119143: turn preparation (incl. STT/vision enrichment) is done — release the
+            # adapter's typing gate so the indicator shows for the agent run itself.
+            # Counterpart of ``_start_typing_refresh``'s readiness gate.
+            try:
+                _ready_adapter = self._delivery_adapter_for(source)
+                if _ready_adapter is not None:
+                    _ready_adapter.resume_typing_for_chat(source.chat_id)
+            except Exception:
+                logger.debug("typing readiness signal failed (non-fatal)")
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
