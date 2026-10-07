@@ -107,6 +107,21 @@ class TestPerJobToolsetMcpMerge:
         assert result == ["web", "finnhub"]
         assert "playwright" not in result
 
+    def test_platform_scoped_server_never_reaches_a_cron_job(self):
+        # platforms: [discord] = server-side scope wins: not auto-added, and dropped even
+        # when the job names it explicitly (parity with _get_platform_tools).
+        cfg = {
+            "mcp_servers": {
+                "discord_admin": {"enabled": True, "platforms": ["discord"]},
+                "finnhub": {"enabled": True},
+            }
+        }
+        merged = _merge_mcp_into_per_job_toolsets(["web"], cfg)
+        assert "finnhub" in merged and "discord_admin" not in merged
+        named = _merge_mcp_into_per_job_toolsets(["web", "discord_admin"], cfg)
+        assert "discord_admin" not in named
+        assert "finnhub" in named
+
     def test_no_mcp_sentinel_opts_out_and_is_stripped(self):
         result = _merge_mcp_into_per_job_toolsets(["web", "no_mcp"], self.CFG)
         assert result == ["web"]

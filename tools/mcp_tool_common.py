@@ -144,6 +144,60 @@ def mcp_server_enabled(cfg: dict) -> bool:
     return _parse_boolish(cfg.get("enabled", True), default=True)
 
 
+#: ``platforms`` list entries that mean "serve every platform" rather than a platform name.
+_ALL_PLATFORM_TOKENS = frozenset({"*", "all", "any"})
+#: Warn once per distinct scope list: resolution runs per turn, and a config typo would
+#: otherwise warn on every one of them.
+_WARNED_UNKNOWN_PLATFORM_SCOPES: set = set()
+
+
+def _known_platform_names() -> set:
+    """Platform keys a ``platforms`` scope can name: gateway platforms (incl. bundled plugin
+    adapters) plus the non-messaging runtimes that resolve toolsets through ``_get_platform_tools``
+    (CLI, cron, ACP). Best-effort — used for typo warnings only."""
+    known: set = {"cli", "cron", "acp"}
+    try:
+        from gateway.config import Platform
+
+        known.update(member.value for member in Platform)
+        try:
+            bundled, _aliases = Platform._scan_bundled_plugin_platforms()
+            known.update(bundled)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return known
+
+
+def mcp_server_allowed_for_platform(cfg: dict, platform: str) -> bool:
+    """Whether ``mcp_servers.<name>`` may serve *platform*. Absent/``null`` ``platforms`` = every
+    platform (backward compatible); a list scopes the server to those platforms only (#110916).
+    ``*``/``all``/``any`` in the list mean every platform; a listed name matching no known
+    platform is warned about (once per distinct list) instead of silently disabling the server."""
+    raw = cfg.get("platforms", None)
+    if raw is None:
+        return True
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple, set)):
+        logger.warning("MCP config expected a list for 'platforms', got %r; ignoring", raw)
+        return True
+    allowed = {str(p).strip().lower() for p in raw if str(p).strip()}
+    if allowed & _ALL_PLATFORM_TOKENS:
+        return True
+    known = _known_platform_names()
+    unknown = allowed - known
+    if unknown and frozenset(allowed) not in _WARNED_UNKNOWN_PLATFORM_SCOPES:
+        _WARNED_UNKNOWN_PLATFORM_SCOPES.add(frozenset(allowed))
+        logger.warning(
+            "MCP 'platforms' scope %s contains unknown name(s) %s (known: %s); use '*', "
+            "'all' or 'any' to serve every platform",
+            sorted(allowed), sorted(unknown), ", ".join(sorted(known)),
+        )
+    return str(platform or "").strip().lower() in allowed
+
+
 def _get_lifecycle_seconds(config: dict, key: str) -> Optional[float]:
     """Optional positive lifecycle timeout from top-level/nested ``lifecycle`` config (``0``
     disables; negatives and non-numbers are warned about and ignored)."""
