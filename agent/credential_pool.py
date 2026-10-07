@@ -681,6 +681,7 @@ def credential_pool_matches_provider(
     provider: Optional[str],
     *,
     base_url: Optional[str] = None,
+    requested_provider: Optional[str] = None,
 ) -> bool:
     """Return whether a pool belongs to the requested runtime provider.
 
@@ -688,8 +689,11 @@ def credential_pool_matches_provider(
     the configured name/provider key, newer runtime paths normalize it to
     ``custom``, and the pool may be keyed as the durable ``providers.<key>``
     slug or as legacy ``custom:<name>``. Accept those aliases only when the
-    runtime endpoint belongs to the same configured custom provider. Empty
-    identities fail closed. Legacy pool adapters without a ``provider``
+    runtime endpoint belongs to the same configured custom provider. A bare
+    ``custom`` agent routed through an unconfigured relayer can also identify
+    a legacy pool by its exact ``custom:<name>`` requested_provider. That
+    identity never overrides an endpoint mapped to a different custom pool.
+    Empty identities fail closed. Legacy pool adapters without a ``provider``
     attribute remain compatible; production pools are scoped.
     """
     raw_pool_provider = getattr(pool_or_provider, "provider", None)
@@ -715,7 +719,20 @@ def credential_pool_matches_provider(
             candidates = custom_provider_pool_key_candidates(base_url or "")
         except Exception:
             return False
-        return pool_provider in {str(key).strip().lower() for key in candidates}
+        candidate_keys = {str(key).strip().lower() for key in candidates}
+        if pool_provider in candidate_keys:
+            return True
+        # Only an unconfigured relayer may use the explicit named identity.
+        # A known different endpoint remains a mismatch, even if a fallback
+        # retained the primary's requested_provider.
+        requested_norm = requested_provider.strip().lower() if isinstance(requested_provider, str) else ""
+        return (
+            not matched_pool
+            and not candidate_keys
+            and bool(_norm_url(base_url))
+            and bool(pool_provider[len(CUSTOM_POOL_PREFIX):].strip())
+            and requested_norm == pool_provider
+        )
 
     runtime_url = _norm_url(base_url)
     if not runtime_url:
@@ -723,7 +740,12 @@ def credential_pool_matches_provider(
     return _legacy_custom_pool_matches(pool_provider, provider_norm, runtime_url)
 
 
-def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str]) -> str:
+def resolve_runtime_pool_key(
+    provider: Optional[str],
+    base_url: Optional[str],
+    *,
+    requested_provider: Optional[str] = None,
+) -> str:
     """Resolve the credential-pool key for a runtime provider identity.
 
     Named custom runtimes retain their configured alias while their pool may
@@ -737,13 +759,21 @@ def resolve_runtime_pool_key(provider: Optional[str], base_url: Optional[str]) -
         return ""
 
     def _accepts(candidate: str) -> bool:
-        return credential_pool_matches_provider(candidate, provider_norm, base_url=base_url)
+        return credential_pool_matches_provider(
+            candidate,
+            provider_norm,
+            base_url=base_url,
+            requested_provider=requested_provider,
+        )
 
     try:
         if provider_norm == "custom":
             candidate = get_custom_provider_pool_key(base_url)
             if candidate and _accepts(candidate):
                 return str(candidate).strip().lower()
+            requested_norm = str(requested_provider or "").strip().lower()
+            if requested_norm.startswith(CUSTOM_POOL_PREFIX) and _accepts(requested_norm):
+                return requested_norm
         else:
             # Named/exact custom runtimes are keyed by identity: search the
             # configured candidates by identity before endpoint so a sibling
