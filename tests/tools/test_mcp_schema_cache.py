@@ -26,6 +26,9 @@ class TestConfigFingerprint:
         assert msc.config_fingerprint(base) != msc.config_fingerprint(
             {**base, "tools": {"include": ["a"]}}
         )
+        assert msc.config_fingerprint(base) != msc.config_fingerprint(
+            {**base, "allowed_tools": ["a"]}
+        )
 
     def test_ignores_non_connection_keys(self):
         base = {"command": "npx", "args": []}

@@ -369,3 +369,38 @@ class TestLazyMcpStatus:
                 status["playwright"]["connected"]) == ("lazy", len(cached), False)
         assert status["eager"]["status"] == "configured" and status["eager"]["tools"] == 0
         assert status["live"]["status"] == "connected" and status["live"]["tools"] == 2
+
+
+class TestCacheLoadAllowedTools:
+    def test_allowed_tools_filters_cache_load_path(self):
+        """allowed_tools must scope the lazy cache-load path too (#106983).
+
+        The cache file is user-writable JSON replayed through its own
+        registration branch; a profile scoped to one tool must not regain
+        the full surface here — nor the any-URI resource utility.
+        """
+        from tools.registry import ToolRegistry
+
+        entry = {
+            "fingerprint": "abc",
+            "tools": [
+                {"name": "browser_navigate", "description": "Navigate",
+                 "inputSchema": {"type": "object", "properties": {}}},
+                {"name": "browser_run", "description": "Run",
+                 "inputSchema": {"type": "object", "properties": {}}},
+            ],
+            "utility_tools": [
+                {"schema": {"name": "mcp__playwright__read_resource",
+                            "description": "Read a resource by URI",
+                            "parameters": {"type": "object", "properties": {}}},
+                 "handler_key": "read_resource"},
+            ],
+        }
+        config = {"command": "npx", "args": [], "lazy": True,
+                  "allowed_tools": ["browser_navigate"]}
+        mock_registry = ToolRegistry()
+        with patch("tools.registry.registry", mock_registry), \
+             patch("toolsets.create_custom_toolset"):
+            registered = _mcp_registration._register_from_cache_sync(
+                "playwright", config, entry)
+        assert registered == ["mcp__playwright__browser_navigate"]

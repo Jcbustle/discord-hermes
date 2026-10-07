@@ -2715,6 +2715,58 @@ class TestMCPSelectiveToolLoading:
         )
         assert registered == []
 
+    def test_allowed_tools_restricts_server_surface(self):
+        """mcp_servers.<name>.allowed_tools is an allowlist (#106983).
+
+        A profile scoping a shared server to one read-only tool must not
+        get the server's full surface, including destructive tools.
+        """
+        config = {
+            "url": "https://mcp.example.com",
+            "allowed_tools": ["list_services"],
+        }
+        registered, _ = self._run_discover(
+            "scoped",
+            ["list_services", "run", "delete_service"],
+            config,
+            session=SimpleNamespace(),
+        )
+        assert registered == ["mcp__scoped__list_services"]
+
+    def test_allowed_tools_blocks_utility_tools(self):
+        """The allowlist gates resource/prompt utility tools too (#106983).
+
+        Utilities are generated on a branch separate from the native-tool
+        loop; without this gate a profile scoped to one tool still gets an
+        any-URI ``read_resource`` side channel.
+        """
+        config = {
+            "url": "https://mcp.example.com",
+            "allowed_tools": ["list_services"],
+        }
+        registered, _ = self._run_discover(
+            "scoped",
+            ["list_services"],
+            config,
+            session=MagicMock(),
+        )
+        assert registered == ["mcp__scoped__list_services"]
+
+    def test_tools_include_wins_over_allowed_tools(self):
+        """tools.include takes precedence; allowed_tools is only a fallback."""
+        config = {
+            "url": "https://mcp.example.com",
+            "tools": {"include": ["run"]},
+            "allowed_tools": ["list_services"],
+        }
+        registered, _ = self._run_discover(
+            "scoped",
+            ["list_services", "run"],
+            config,
+            session=SimpleNamespace(),
+        )
+        assert registered == ["mcp__scoped__run"]
+
     def test_enabled_false_skips_connection_attempt(self):
         from tools.mcp_tool_discovery import discover_mcp_tools
 

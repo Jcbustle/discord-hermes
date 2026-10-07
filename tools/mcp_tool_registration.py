@@ -215,7 +215,10 @@ def _existing_tool_names() -> List[str]:
 
 def _make_tool_filter(name: str, config: dict) -> Callable[[str], bool]:
     """Include/exclude predicate for a server's tool names: ``tools.include`` is a whitelist (``[]`` = register
-    nothing), ``tools.exclude`` a blacklist; entries are exact names or fnmatch globs; include wins over exclude."""
+    nothing), ``tools.exclude`` a blacklist; entries are exact names or fnmatch globs; include wins over exclude.
+    Top-level ``allowed_tools`` is a fallback allowlist alias (#106983): a scoping key that reads as an access
+    boundary must never be silently inert, so it applies when ``tools.include`` is absent; an explicit
+    ``tools.include`` still wins. Both set is a config smell (the fallback is dropped) — warn, not ignore silently."""
     tools_filter = config.get("tools") or {}
     # Selective tool loading: honour include/exclude lists from config. Rules (matching issue #690 spec,
     # extended with glob support): tools.include — whitelist: only matching tool names are registered
@@ -224,7 +227,16 @@ def _make_tool_filter(name: str, config: dict) -> Callable[[str], bool]:
     # (an explicit empty whitelist, as written by the install checklist's "uncheck everything" path) Neither
     # set → register all tools (backward-compatible default)
     include_raw = tools_filter.get("include")
-    include_set = _normalize_name_filter(include_raw, f"mcp_servers.{name}.tools.include")
+    allowed_raw = config.get("allowed_tools")
+    include_label = f"mcp_servers.{name}.tools.include"
+    if include_raw is None and allowed_raw is not None:
+        include_raw = allowed_raw
+        include_label = f"mcp_servers.{name}.allowed_tools"
+    elif include_raw is not None and allowed_raw is not None:
+        logger.warning(
+            "MCP server '%s': both tools.include and allowed_tools are set; allowed_tools is ignored "
+            "(tools.include takes precedence)", name)
+    include_set = _normalize_name_filter(include_raw, include_label)
     exclude_set = _normalize_name_filter(tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude")
     if isinstance(include_raw, (str, list, tuple, set)):
         return lambda tool_name: matches_name_filter(tool_name, include_set)
@@ -270,12 +282,19 @@ def _tool_candidates(name: str, tools: Iterable[Any], should_register: Callable[
     return out
 
 
-def _utility_candidates(name: str, entries: Iterable[Any], tool_timeout) -> List[_Candidate]:
-    """``{schema, handler_key}`` rows (live selection or cache) -> candidates; malformed rows dropped."""
+def _utility_candidates(name: str, entries: Iterable[Any], tool_timeout,
+                        should_register: Callable[[str], bool]) -> List[_Candidate]:
+    """``{schema, handler_key}`` rows (live selection or cache) -> candidates; malformed rows dropped.
+    Utility tools are subject to the same config allowlist as native tools, matched by the BARE handler key
+    (``read_resource``) — never the prefixed registry name (``mcp__<srv>__read_resource``): a profile scoping
+    a server to one documented tool must not retain an any-URI ``read_resource`` side channel (#106983)."""
     out: List[_Candidate] = []
     for raw in entries:
         schema, key = (raw.get("schema"), raw.get("handler_key")) if isinstance(raw, dict) else (None, None)
         if isinstance(schema, dict) and key in _UTILITY_HANDLER_FACTORIES and schema.get("name"):
+            if not should_register(key):
+                logger.debug("MCP server '%s': skipping utility '%s' (filtered by config)", name, key)
+                continue
             out.append(_Candidate(schema["name"], f"{_UTILITY_ORIGIN_PREFIX}{key!r}", schema,
                                   _UTILITY_HANDLER_FACTORIES[key](name, tool_timeout)))
     return out
@@ -405,7 +424,8 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     key = _server_key_for_task(server)
     _record_tool_trust_metadata(name, config, server._tools, key)
     candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
-    candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
+    candidates += _utility_candidates(
+        name, _select_utility_schemas(name, server, config), server.tool_timeout, should_register)
     registered = _register_candidates(
         name, _resolve_name_collisions(name, candidates),
         check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(key), lazy=False, key=key)
@@ -568,9 +588,10 @@ def _register_connected_into_current_scope(servers: dict) -> int:
         _record_scope_trust(name, config, scope)
         if registry.get_tool_names_for_toolset(f"mcp-{name}"):
             continue
-        candidates = _tool_candidates(name, server._tools, _make_tool_filter(name, config), server.tool_timeout)
+        should_register = _make_tool_filter(name, config)
+        candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
         candidates += _utility_candidates(
-            name, _select_utility_schemas(name, server, config), server.tool_timeout)
+            name, _select_utility_schemas(name, server, config), server.tool_timeout, should_register)
         names = _register_candidates(
             name, _resolve_name_collisions(name, candidates),
             check_fn=_make_check_fn(name), scope=lambda: scope, lazy=False, key=key)
@@ -594,8 +615,9 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     tool_timeout = _resolve_tool_timeout(config)
     cached_tools = _cached_tools(tools_from_cache_entry(entry))
     _record_tool_trust_metadata(name, config, cached_tools)
-    candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
-    candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
+    should_register = _make_tool_filter(name, config)
+    candidates = _tool_candidates(name, cached_tools, should_register, tool_timeout)
+    candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout, should_register)
     registered = _register_candidates(
         name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True)
     if registered:

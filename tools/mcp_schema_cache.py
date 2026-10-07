@@ -27,13 +27,19 @@ def _cache_path() -> Path:
 def config_fingerprint(config: dict) -> str:
     """Stable hash of the connection-defining parts of an MCP server config."""
     tools_filter = config.get("tools") or {}
+    allowed_raw = config.get("allowed_tools")
+    if isinstance(allowed_raw, str):
+        allowed_raw = [allowed_raw]
+    if not isinstance(allowed_raw, (list, tuple, set)):
+        allowed_raw = []
     payload = {
         "command": config.get("command"),
         "args": config.get("args") or [],
         "url": config.get("url"),
         "transport": config.get("transport"),
         "tools_include": sorted(tools_filter.get("include") or []),
-        "tools_exclude": sorted(tools_filter.get("exclude") or [])}
+        "tools_exclude": sorted(tools_filter.get("exclude") or []),
+        "allowed_tools": sorted(str(v) for v in allowed_raw)}
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
