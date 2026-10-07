@@ -39,8 +39,9 @@ def _spool_dropped(session_id: str, message: Dict[str, Any]):
 
 # Message keys persisted only for assistant rows (None otherwise).
 _ASSISTANT_ONLY_KEYS = (
-    "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items",
-    "codex_message_items",
+    "reasoning", "reasoning_content", "reasoning_details",
+    "anthropic_content_blocks", "bedrock_content_blocks",
+    "codex_reasoning_items", "codex_message_items",
 )
 # Message keys bound straight to a TEXT column. A spooled message is JSON from disk, and a dict or list
 # here makes sqlite refuse the whole row.
@@ -77,6 +78,7 @@ def transcript_append_kwargs(session_id: str, message: Dict[str, Any], *, fallba
         "tool_calls": message.get("tool_calls"),
         "tool_call_id": message.get("tool_call_id"),
         **{k: message.get(k) if is_assistant else None for k in _ASSISTANT_ONLY_KEYS},
+        "reasoning_route": message.get("_reasoning_route") if is_assistant else None,
         "platform_message_id": message.get("platform_message_id") or message.get("message_id"),
         "observed": bool(message.get("observed")),
         "timestamp": fallback_ts if timestamp is None else timestamp,

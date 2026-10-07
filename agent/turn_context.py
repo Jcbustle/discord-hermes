@@ -95,10 +95,13 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
     """Whether the active route replays stale thinking text; ``True`` (conservative full
     charge) when route facts are unavailable."""
     try:
+        from agent.agent_runtime_helpers import reasoning_replay_field_for_api
         from agent.message_sanitization import stale_thinking_reaches_wire
 
         return stale_thinking_reaches_wire(
-            *(_str_attr(agent, k) for k in ("api_mode", "provider", "model", "base_url"))
+            *(_str_attr(agent, k) for k in ("api_mode", "provider", "model", "base_url")),
+            reasoning_replay_field=reasoning_replay_field_for_api(agent),
+            reasoning_echo=bool(getattr(agent, "_reasoning_echo_flag", False)),
         )
     except Exception:
         return True
@@ -1235,6 +1238,7 @@ def build_api_messages(
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
     from agent.conversation_loop import _clone_message_for_send
     from agent.replay_cleanup import canonicalize_replay_history
+    from run_agent import AIAgent
 
     has_current = isinstance(current_turn_user_idx, int) and 0 <= current_turn_user_idx < len(messages)
     current_turn_message = messages[current_turn_user_idx] if has_current else None
@@ -1289,12 +1293,24 @@ def build_api_messages(
             # and assistant rows may carry a sanitize-divergence sidecar.
             api_msg["content"] = _api_content
 
+        # Classify textless interims before route filtering erases their only
+        # payload. Otherwise empty-row repair fabricates visible assistant stubs
+        # that survive after the Codex continuation nudges are removed.
+        if agent.api_mode != "codex_responses" and AIAgent._is_thinking_only_assistant(api_msg):
+            continue
+
         # Pass reasoning back to the API for ALL assistant messages so multi-turn
-        # reasoning context is preserved.
-        agent._copy_reasoning_content_for_api(msg, api_msg)
-        # 'reasoning' is trajectory-only (copied to 'reasoning_content' above);
-        # finish_reason is rejected by strict APIs (e.g. Mistral).
-        api_msg.pop("reasoning", None)
+        # reasoning context is preserved. Keep the internal provenance marker
+        # until after the optional context-selection hook, which may replace
+        # this request with raw canonical messages. The final pass validates
+        # and strips it.
+        agent._copy_reasoning_content_for_api(
+            msg, api_msg, retain_route_provenance=True
+        )
+        # ``reasoning`` is normally trajectory-only. An explicitly
+        # configured replay provider may consume it as a wire field.
+        if agent._reasoning_replay_field_for_api() != "reasoning":
+            api_msg.pop("reasoning", None)
         api_msg.pop("finish_reason", None)
         # Fill empty non-final user/assistant wire copies so the pre-call sanitizer
         # stops re-healing and flooding errors.log; durable history is untouched.

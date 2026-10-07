@@ -156,14 +156,14 @@ class ReasoningParamsMixin:
 
     def _needs_thinking_reasoning_pad(self) -> bool:
         """True when the provider enforces ``reasoning_content`` echo-back on tool-call replays (DeepSeek, Kimi,
-        MiMo thinking all 400 without it). Cached per (provider, model, base_url), invalidated by
-        ``switch_model()`` / ``_try_activate_fallback()`` — called ~16× per turn.
+        MiMo thinking all 400 without it). Cached per route and resolved echo opt-in, so same-route
+        ``switch_model()`` / fallback policy changes invalidate it — called ~16× per turn.
 
         DeepSeek v4 thinking and Kimi / Moonshot thinking both reject replays of assistant tool-call
         messages that omit ``reasoning_content`` (refs 15250, #17400). Xiaomi MiMo thinking mode has the
         same requirement.
         """
-        key = (self.provider, self.model, getattr(self, "_base_url_lower", self.base_url))
+        key = (self.provider, self.model, getattr(self, "_base_url_lower", self.base_url), self._reasoning_echo_opt_in())
         cached = getattr(self, "_thinking_pad_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -206,6 +206,8 @@ class ReasoningParamsMixin:
         return matches_reasoning_echo_family("mimo", (self.provider or "").lower(), self.model, self.base_url)
 
     _copy_reasoning_content_for_api = _forward("agent.agent_runtime_helpers", "copy_reasoning_content_for_api")
+
+    _reasoning_replay_field_for_api = _forward("agent.agent_runtime_helpers", "reasoning_replay_field_for_api")
 
     _reapply_reasoning_echo_for_provider = _forward("agent.agent_runtime_helpers", "reapply_reasoning_echo_for_provider")
 

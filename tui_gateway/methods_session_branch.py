@@ -11,8 +11,8 @@ _registry = HandlerRegistry()
 
 # ── session.branch ───────────────────────────────────────────────────
 def _visible_branch_history(messages) -> list:
-    """user/assistant rows with visible text, as FULL copies (reasoning + timeline-marker tags survive)."""
-    return [dict(message) for message in messages or []
+    """Visible user/assistant copies; discarded tool exchanges have no native replay authority."""
+    return [_display_only_replay_copy(message) for message in messages or []
             if isinstance(message, dict) and message.get("role") in {"user", "assistant"}
             and _coerce_message_text(message.get("content")).strip()]
 
@@ -48,7 +48,9 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
 
 
 _BRANCH_COPY_FIELDS = (
-    "reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items",
+    "reasoning", "reasoning_content", "reasoning_details", "_reasoning_route",
+    "anthropic_content_blocks", "bedrock_content_blocks",
+    "codex_reasoning_items", "codex_message_items",
     # Timeline markers ride as role=user; untagged they become bare user turns after a restart, corrupting
     # the truncate ordinal address space.
     "display_kind", "display_metadata",
