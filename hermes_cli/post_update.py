@@ -87,11 +87,27 @@ def step_migrate_config() -> dict:
 
     backups = _backup_existing((get_config_path(), get_env_path()))
     try:
-        migrate_config(interactive=False, quiet=True)
+        migrated = migrate_config(interactive=False, quiet=True)
     except Exception:
         _restore_backups(backups)
         raise
     post_ver, _ = check_config_version()
+    # A migration step that raised is SKIPPED, not an anomaly: migrate_config stamps the
+    # highest contiguous success, so post_ver legitimately sits below latest_ver. Rolling
+    # back here would undo the steps that DID advance and fail the boot, so keep the
+    # partial advance and let the next boot retry the pending step (#119658).
+    pending = list((migrated or {}).get("skipped_migrations") or [])
+    if pending:
+        try:
+            from hermes_cli.update_receipt import record_skip
+
+            record_skip(
+                "migrate_config",
+                "migrations still pending: " + ", ".join(f"v{v}" for v in pending),
+            )
+        except Exception:  # a receipt record must never break the boot step
+            logger.debug("could not record migrate_config skip", exc_info=True)
+        return {"ok": True, "migrated": f"{current_ver}->{post_ver}", "skipped": pending}
     if post_ver < latest_ver:
         restored = _restore_backups(backups)
         raise RuntimeError(

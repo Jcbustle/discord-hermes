@@ -80,7 +80,7 @@ def main() -> int:
         f"backups: {backup_text}"
     )
     try:
-        migrate_config(interactive=False, quiet=False)
+        migrated = migrate_config(interactive=False, quiet=False)
     except Exception:
         restored = _restore_backups(backups)
         if restored:
@@ -91,6 +91,19 @@ def main() -> int:
         raise
 
     post_ver, _ = check_config_version()
+    # A step that raised is skipped (retryable), not an anomaly: migrate_config stamps the
+    # highest contiguous success, so post_ver legitimately sits below latest_ver. Rolling
+    # back would undo the steps that DID advance and block the boot; warn and let the next
+    # boot retry, matching the below-floor posture above (#119658).
+    pending = list((migrated or {}).get("skipped_migrations") or [])
+    if pending:
+        print(
+            "[config-migrate] WARNING: migration step(s) "
+            + ", ".join(f"v{v}" for v in pending)
+            + f" were skipped; config advanced {current_ver} -> {post_ver} and will retry",
+            file=sys.stderr,
+        )
+        return 0
     if post_ver < latest_ver:
         restored = _restore_backups(backups)
         restored_text = ", ".join(str(path) for path in restored) if restored else "none"

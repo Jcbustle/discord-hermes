@@ -8,6 +8,7 @@ fails or does not advance the version.
 from pathlib import Path
 
 import pytest
+import yaml
 
 from hermes_cli import post_update
 from hermes_cli.post_update import (
@@ -99,6 +100,31 @@ def test_migrate_config_restores_backup_when_version_does_not_advance(
     assert config_path.read_text(encoding="utf-8") == "_config_version: 20\n"
     backups = list(tmp_path.glob("config.yaml.bak-*"))
     assert backups, "backup file must exist"
+
+
+def test_migrate_config_keeps_partial_advance_when_a_step_is_skipped(tmp_path, monkeypatch):
+    """A skipped step is retryable, not an anomaly: stamp the contiguous success, keep
+    the backups, and report the pending target instead of rolling back (#119658)."""
+    import hermes_cli.config_migrations as mig
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("_config_version: 44\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    def _boom(results, quiet):
+        raise ImportError("v46 exploded (simulated)")
+
+    monkeypatch.setattr(
+        mig, "MIGRATIONS",
+        ((45, lambda results, quiet: None), (46, _boom)),
+    )
+
+    result = step_migrate_config()
+
+    assert result == {"ok": True, "migrated": "44->45", "skipped": [46]}
+    # The rollback path would have reset this to 44; the partial advance must survive.
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))
+    assert raw["_config_version"] == 45
 
 
 # ── step_state_db_guard ──────────────────────────────────────────────

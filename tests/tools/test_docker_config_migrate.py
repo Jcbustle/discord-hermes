@@ -208,6 +208,32 @@ def test_docker_config_migrate_restores_backups_when_version_does_not_advance(
     assert env_path.read_text(encoding="utf-8") == original_env
 
 
+def test_docker_config_migrate_keeps_partial_advance_when_a_step_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A skipped step must not roll back the steps that DID advance or block the boot (#119658)."""
+    module = _load_script_module()
+    config_path = tmp_path / "config.yaml"
+    env_path = tmp_path / ".env"
+    config_path.write_text(yaml.safe_dump({"_config_version": 44}), encoding="utf-8")
+
+    monkeypatch.setattr(
+        module, "_read_config_version_stamp",
+        lambda *, raise_on_parse_error=False: (44, DEFAULT_CONFIG["_config_version"]))
+    monkeypatch.setattr(module, "check_config_version", lambda: (45, DEFAULT_CONFIG["_config_version"]))
+    monkeypatch.setattr(module, "get_config_path", lambda: config_path)
+    monkeypatch.setattr(module, "get_env_path", lambda: env_path)
+
+    def _skipping_migrate(*, interactive: bool, quiet: bool):
+        config_path.write_text(yaml.safe_dump({"_config_version": 45}), encoding="utf-8")
+        return {"skipped_migrations": [46]}
+
+    monkeypatch.setattr(module, "migrate_config", _skipping_migrate)
+
+    assert module.main() == 0
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))["_config_version"] == 45
+
+
 def test_docker_config_migrate_second_boot_preserves_env_byte_for_byte(tmp_path: Path) -> None:
     """Regression for #51579: booting ``gateway run`` twice (i.e. a host
     reboot under ``--restart unless-stopped``) must not strip or rewrite
