@@ -18,6 +18,34 @@ _SKIP_LABEL = "Skip (keep current)"
 _CURRENT_SUFFIX = "  ← currently in use"
 
 
+def prompt_cache_ttl_legend() -> Optional[str]:
+    """Legend for the picker's Cache column, or None when prompt caching is off.
+
+    Built from the same vocabulary the runtime uses (#123945): the only tiers
+    are ``VALID_CACHE_TTLS`` ('5m'/'1h'), and 'auto' resolves by session
+    source. Every caller of this picker is an interactive login/setup flow
+    (cli/tui/desktop — none of the machine-paced sources), so 'auto' reports
+    the tier it picks there; unknown values keep the runtime's '5m' default.
+    On any read failure: no legend, never a guess.
+    """
+    try:
+        from agent.agent_runtime_helpers import VALID_CACHE_TTLS, cache_ttl_means_disabled
+        from agent.prompt_caching import AUTO_CACHE_TTL, auto_cache_ttl_for_source
+        from hermes_cli.config import load_config_readonly
+
+        raw = (load_config_readonly().get("prompt_caching", {}) or {}).get("cache_ttl", "5m")
+        if cache_ttl_means_disabled(raw):
+            return None
+        if raw == AUTO_CACHE_TTL:
+            return (
+                f"Cache TTL: {auto_cache_ttl_for_source('cli')} "
+                f"(auto; {auto_cache_ttl_for_source('cron')} for cron/subagent)"
+            )
+        return f"Cache TTL: {raw if raw in VALID_CACHE_TTLS else VALID_CACHE_TTLS[0]}"
+    except Exception:
+        return None
+
+
 def _confirm_selection_guards(
     model_id: str, *, provider: str = "", base_url: str = "", api_key: str = "",
     include_kinds: Optional[List[str]] = None,
@@ -147,6 +175,10 @@ class _ModelPickerRows:
             title += header + "  $/Mtok"
             if self.any_on_sale:
                 title += "  ★ = on sale"
+            if self.has_cache:
+                legend = prompt_cache_ttl_legend()
+                if legend:
+                    title += f"\n{pad}{legend}"
         return title
 
 
