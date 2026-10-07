@@ -8,7 +8,7 @@ import { $layoutTree, noteActiveTreeGroup } from '@/components/pane-shell/tree/s
 import { SidebarProvider } from '@/components/ui/sidebar'
 import { registry } from '@/contrib/registry'
 import { $connectionsRegistry } from '@/store/connection-registry-state'
-import { $sidebarMessagingOpenIds, setSidebarAgentsGrouped, setSidebarGrouping } from '@/store/layout'
+import { $sidebarMessagingOpenIds, $sidebarRecencyFilter, setSidebarAgentsGrouped, setSidebarGrouping } from '@/store/layout'
 import { $activeGatewayProfile, $profiles, setShowAllProfiles } from '@/store/profile'
 import { $projectScope, ALL_PROJECTS } from '@/store/project-scope'
 import { $projectTree } from '@/store/projects'
@@ -499,5 +499,46 @@ describe('ChatSidebar messaging owners', () => {
     expect(telegramGroups()).toHaveLength(0)
     expect(screen.queryByText('work-1')).toBeNull()
     expect(within(row('default-1')).queryByRole('img', { name: /^Profile:/ })).toBeNull()
+  })
+})
+
+// The recency window is evaluated against the wall clock, so the list has to age
+// sessions out on its own — no store write arrives to recompute the memo.
+describe('ChatSidebar recency filter follows the clock', () => {
+  const NOW = new Date('2026-01-15T12:00:00Z').getTime()
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    $sessionsLoading.set(false)
+    $sidebarRecencyFilter.set(['1d'])
+    $sessions.set([
+      makeSessionInfo({
+        id: 'aging',
+        last_active: NOW / 1000 - (24 * 60 * 60 - 300),
+        profile: 'default',
+        started_at: NOW / 1000 - 25 * 60 * 60,
+        title: 'Aging session'
+      })
+    ])
+  })
+
+  afterEach(() => {
+    cleanup()
+    $sidebarRecencyFilter.set([])
+    $sessions.set([])
+    $sessionsLoading.set(true)
+    vi.useRealTimers()
+  })
+
+  it('drops a session once it crosses the 24h window while mounted', () => {
+    renderSidebar('/', 'chat')
+    expect(screen.getByText('Aging session')).toBeTruthy()
+
+    act(() => {
+      vi.advanceTimersByTime(10 * 60 * 1000)
+    })
+
+    expect(screen.queryByText('Aging session')).toBeNull()
   })
 })
