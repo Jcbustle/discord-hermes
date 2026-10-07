@@ -670,6 +670,29 @@ def profile_from_session_key_namespace(namespace: str) -> str:
     return "main" if namespace == "main~" else namespace
 
 
+def resolve_stop_target(command_args: str) -> tuple[str, ...]:
+    """Namespace candidates a ``/stop @<token>`` scopes to (#123928).
+
+    Shared by every /stop entry point (idle dispatch, busy fast-path, pending
+    sentinel) so the target token is parsed in exactly one place. Returns ``()`` for a
+    bare ``/stop`` — the caller's own namespace. ``main`` is the default bot's
+    user-facing spelling (its keys live under ``agent:main``), while a profile
+    literally named ``main`` is marked ``agent:main~`` so the two never share keys
+    (see :func:`_session_key_namespace`) — so the single token covers both; ``default``
+    keeps naming the default bot alone, and any other token maps to its own profile
+    namespace.
+    """
+    text = (command_args or "").strip()
+    if text[:1] != "@":
+        return ()
+    token = text.split(None, 1)[0].lstrip("@").rstrip(",.;:!?").lower()
+    if not token:
+        return ()
+    if token == "main":
+        return ("agent:main", "agent:main~")
+    return (_session_key_namespace(token),)
+
+
 def _canonical_participant(source: SessionSource) -> Optional[str]:
     """Sender id for key isolation; WhatsApp JID/LID aliases are canonicalized so alias flips
     cannot split one member into two sessions."""

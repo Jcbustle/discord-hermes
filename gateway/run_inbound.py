@@ -708,6 +708,13 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
         running_agent = _ra_state.turn.agent if _ra_state else None
         if running_agent is _AGENT_PENDING_SENTINEL:  # agent still being set up
             if event.get_command() == "stop":  # force-clean the sentinel so the session is unlocked
+                from gateway.session import resolve_stop_target
+                _target_ns = resolve_stop_target(event.get_command_args())
+                if _target_ns and not any(_quick_key.startswith(ns + ":") for ns in _target_ns):
+                    # /stop @other: never unlock the CALLER's starting session for a stop
+                    # aimed at another bot — the shared resolver hands the target to the
+                    # scoped handler instead (#123928 review).
+                    return await self._handle_stop_command(event)
                 self._release_running_agent_state(_quick_key)
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply(t("gateway.stop.force_stopped_pending"))

@@ -21,7 +21,7 @@ from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import canonical_whatsapp_identifier
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -1016,6 +1016,18 @@ class GatewayBusySessionMixin:
         return format_status_text()
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
+        # A targeted /stop must never be silently downgraded to "stop the caller": the
+        # target token is resolved by the same shared resolver the idle path uses
+        # (#123928 review). When the target is another bot, hand off to the full handler,
+        # which stops exactly that namespace's runs in this chat and declines (with the
+        # no-active reply) when the target has nothing running. Only an untargeted stop
+        # or one naming the caller's own namespace takes the hard-kill fast path.
+        from gateway.session import resolve_stop_target
+        target_ns = resolve_stop_target(event.get_command_args())
+        if target_ns and not any(quick_key.startswith(ns + ":") for ns in target_ns):
+            logger.info(
+                "STOP (busy, targeted) for session %s — delegating to the scoped handler", quick_key)
+            return await self._handle_stop_command(event)
         # Hard-kill: a soft interrupt can't reach a truly hung executor thread.
         from gateway.run import _INTERRUPT_REASON_STOP
         await self._interrupt_and_clear_session(
@@ -1137,14 +1149,19 @@ class GatewayBusySessionMixin:
             suffix = t("gateway.unauthorized.admin_only_none")
         return t("gateway.unauthorized.admin_only", command=canonical_cmd, suffix=suffix)
 
-    def _same_chat_runs(self, source: SessionSource, own_key: str) -> List[Tuple[str, str, str]]:
+    def _same_chat_runs(
+        self, source: SessionSource, own_key: str, namespaces: Optional[Sequence[str]] = None,
+    ) -> List[Tuple[str, str, str]]:
         """``(key, chat_type, tail)`` for every OTHER running turn in the caller's chat (``tail`` is
         the key text after the chat id, ``""`` when the key ends there).
 
-        The namespace comes from ``own_key`` — the session store's own answer, so a named-profile
-        stop matches that profile's runs and never a literal. ``_snapshot_running_agents`` already
-        drops the pending sentinel (a session still being set up has no agent). Callers gate on
-        authorization; ``own_key`` is excluded. Both tiers share one call.
+        The head(s) come from ``own_key`` — the session store's own answer, so a named-profile
+        stop matches that profile's runs and never a literal — unless ``namespaces`` overrides
+        them with one or more ``agent:<ns>`` candidates (``/stop @bot`` scans the target bot's
+        head, not the caller's; ``resolve_stop_target`` can yield two spellings for one bot).
+        ``_snapshot_running_agents`` already drops the pending sentinel (a session still being set
+        up has no agent). Callers gate on authorization; ``own_key`` is excluded. Both tiers share
+        one call.
         """
         chat_id = str(getattr(source, "chat_id", None) or "")
         if not chat_id:
@@ -1153,14 +1170,20 @@ class GatewayBusySessionMixin:
             # Match the same text build_session_key keyed: WhatsApp DM chat ids are canonicalised
             # there, so a raw JID/LID alias would never line up with the stored key.
             chat_id = canonical_whatsapp_identifier(chat_id) or chat_id
-        namespace = ":".join(own_key.split(":", 2)[:2])
-        prefix = f"{namespace}:{source.platform.value}:"
+        if not namespaces:
+            namespaces = (":".join(own_key.split(":", 2)[:2]),)
+        prefixes = tuple(f"{ns}:{source.platform.value}:" for ns in namespaces)
         scope_id = str(getattr(source, "scope_id", None) or "") or None
         runs = []
         for key in self._snapshot_running_agents():
             if key == own_key:
                 continue
-            parsed = _same_chat_key_slots(key, prefix=prefix, chat_id=chat_id, scope_id=scope_id)
+            parsed = None
+            for prefix in prefixes:
+                parsed = _same_chat_key_slots(
+                    key, prefix=prefix, chat_id=chat_id, scope_id=scope_id)
+                if parsed is not None:
+                    break
             if parsed is not None:
                 runs.append((key, parsed[0], parsed[1]))
         return runs
