@@ -257,7 +257,11 @@ def gateway_lifecycle_block(
             "uninstall the gateway from inside the gateway process. The gateway would "
             "kill this command before it could complete (SIGTERM propagates "
             "to child processes). Run `hermes gateway restart` from a "
-            "separate shell outside the running gateway.",
+            "separate shell outside the running gateway. Users can also run "
+            "/restart from chat; agents have no sanctioned in-session "
+            "self-restart yet (see #126501). To stop only a process you own, "
+            "use process(action=\"kill\", session_id=\"proc_…\") or its explicit "
+            "PID instead.",
             "error",
         )
     return None
