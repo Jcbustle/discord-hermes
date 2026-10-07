@@ -15,7 +15,7 @@ import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
@@ -40,55 +40,134 @@ def _str_attr(agent: Any, name: str) -> str:
     return getattr(agent, name, "") or ""
 
 
+class RequestRoute(NamedTuple):
+    """The route facts a request is priced against — the axes a destination's wire differs on."""
+
+    model: str = ""
+    provider: str = ""
+    base_url: str = ""
+    api_mode: str = ""
+
+
+class RequestPressure(NamedTuple):
+    """A read-only projection of the tokens one route reads for one request.
+
+    ``evidence`` names the producer: ``anchor`` (a provider usage reading), ``native``
+    (the checkpoint-pruned Responses payload) or ``generic`` (the rough transcript
+    estimator charged with the route's own stale-thinking policy).
+    """
+
+    tokens: int
+    evidence: str
+
+
+def route_facts(agent: Any) -> RequestRoute:
+    """The request route an agent is on, read off partial agents/doubles (``""`` when absent)."""
+    return RequestRoute(
+        model=_str_attr(agent, "model"), provider=_str_attr(agent, "provider"),
+        base_url=_str_attr(agent, "base_url"), api_mode=_str_attr(agent, "api_mode"),
+    )
+
+
+def project_request_pressure(
+    route: RequestRoute,
+    messages: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools: Optional[List[Dict[str, Any]]] = None,
+    anchor: Optional[int] = None,
+    native_agent: Any = None,
+) -> Optional[RequestPressure]:
+    """The one read-only owner of "how many tokens does this route read for this request".
+
+    Both consumers size through it: automatic preflight (the live agent, for the route it is
+    about to send on) and the model-switch assessment (the destination's route facts, so a
+    stored transcript is projected the way the destination's wire will read it — pruned to
+    the checkpoint on an eligible native Responses route, and charged for stale thinking only
+    when this route replays it). Never mutates ``agent``: ``native_agent`` is a route-carrying
+    view the caller may build read-only, and ``anchor`` is usage evidence for ``messages``.
+    """
+    if not isinstance(messages, list):
+        return None
+    if anchor is not None:
+        return RequestPressure(int(anchor), "anchor")
+    if native_agent is not None and _str_attr(native_agent, "api_mode") == "codex_responses":
+        try:
+            from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens
+
+            native = estimate_native_responses_preflight_tokens(
+                native_agent, messages, system_prompt=system_prompt or "", tools=tools
+            )
+        except Exception:
+            logger.debug(
+                "native Responses preflight estimate unavailable; "
+                "using generic transcript estimate",
+                exc_info=True,
+            )
+            native = None
+        if isinstance(native, int) and not isinstance(native, bool) and native >= 0:
+            return RequestPressure(native, "native")
+    try:
+        from agent.message_sanitization import stale_thinking_reaches_wire
+
+        charge = stale_thinking_reaches_wire(
+            route.api_mode, route.provider, route.model, route.base_url
+        )
+    except Exception:
+        charge = True
+    if charge and route.api_mode == "anthropic_messages" and native_agent is not None:
+        # A rejected thinking signature is suppressed on the wire, so this route reads the exact
+        # native replay carriers rather than the generic transcript estimate — the runtime
+        # preflight's own branch, carried into the one projection owner.
+        try:
+            from agent.anthropic_thinking_policy import native_anthropic_preserves_prior_thinking
+
+            if native_anthropic_preserves_prior_thinking(route.base_url, route.model):
+                from agent.anthropic_thinking_replay import apply_rejected_thinking_suppression
+
+                # Preflight runs on canonical history, while the eventual request is a
+                # filtered copy. Mirror suppression onto shallow message copies before
+                # pricing the exact native replay carriers.
+                estimate_messages = [
+                    dict(message) if isinstance(message, dict) else message
+                    for message in messages
+                ]
+                apply_rejected_thinking_suppression(native_agent, estimate_messages)
+                return RequestPressure(
+                    int(estimate_native_anthropic_request_tokens_rough(
+                        estimate_messages, system_prompt=system_prompt or "", tools=tools
+                    )),
+                    "native",
+                )
+        except Exception:
+            logger.debug(
+                "native Anthropic preflight estimate unavailable; "
+                "using generic transcript estimate",
+                exc_info=True,
+            )
+    return RequestPressure(
+        int(estimate_request_tokens_rough(
+            messages, system_prompt=system_prompt or "", tools=tools,
+            charge_stale_thinking=charge,
+        )),
+        "generic",
+    )
+
+
 def _preflight_request_tokens(
     agent: Any, messages: List[Dict[str, Any]], system_prompt: str
 ) -> int:
     """Token estimate for automatic preflight compression: a valid provider usage anchor,
-    else the checkpoint-pruned native wire payload, else the generic estimator."""
+    else the checkpoint-pruned native wire payload, else the generic estimator — sized by
+    ``project_request_pressure``, the same owner the switch assessment prices a destination
+    with, so the runtime and the warning cannot size one request two ways."""
     anchored = anchored_context_tokens(messages, getattr(agent, "_usage_anchor", None))
     agent._request_pressure_anchored = anchored is not None
-    if anchored is not None:
-        return anchored
-    tools = getattr(agent, "tools", None) or None
-    try:
-        from agent.codex_responses_adapter import estimate_native_responses_preflight_tokens
-
-        native = estimate_native_responses_preflight_tokens(
-            agent, messages, system_prompt=system_prompt or "", tools=tools
-        )
-        if isinstance(native, int) and not isinstance(native, bool) and native >= 0:
-            return native
-    except Exception:
-        logger.debug(
-            "native Responses preflight estimate unavailable; "
-            "using generic transcript estimate",
-            exc_info=True,
-        )
-    charge_stale_thinking = _agent_stale_thinking_on_wire(agent)
-    estimate_messages = messages
-    if charge_stale_thinking and getattr(agent, "api_mode", "") == "anthropic_messages":
-        from agent.anthropic_thinking_policy import native_anthropic_preserves_prior_thinking
-
-        if native_anthropic_preserves_prior_thinking(
-            getattr(agent, "base_url", ""), getattr(agent, "model", "")
-        ):
-            from agent.anthropic_thinking_replay import apply_rejected_thinking_suppression
-
-            # Preflight runs on canonical history, while the eventual request is a
-            # filtered copy. Mirror suppression onto shallow message copies before
-            # pricing the exact native replay carriers.
-            estimate_messages = [
-                dict(message) if isinstance(message, dict) else message
-                for message in messages
-            ]
-            apply_rejected_thinking_suppression(agent, estimate_messages)
-            return estimate_native_anthropic_request_tokens_rough(
-                estimate_messages, system_prompt=system_prompt or "", tools=tools
-            )
-    return estimate_request_tokens_rough(
-        estimate_messages, system_prompt=system_prompt or "", tools=tools,
-        charge_stale_thinking=charge_stale_thinking,
+    projection = project_request_pressure(
+        route_facts(agent), messages, system_prompt=system_prompt or "",
+        tools=getattr(agent, "tools", None) or None, anchor=anchored, native_agent=agent,
     )
+    return projection.tokens if projection is not None else 0
 
 
 def _agent_stale_thinking_on_wire(agent: Any) -> bool:
