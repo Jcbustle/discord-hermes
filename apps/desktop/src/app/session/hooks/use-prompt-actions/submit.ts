@@ -37,6 +37,7 @@ import {
 } from '@/store/session'
 import { profileScopeForSessionOwner } from '@/store/session-request-router'
 import { $sessionStates, $sessionTiles } from '@/store/session-states'
+import { $bargeInEnabled } from '@/store/voice-prefs'
 import type { SessionInfo } from '@/types/hermes'
 
 import { isCronRunSessionId, refreshCronRunWriteGate } from '../../../cron/open-cron-run'
@@ -253,8 +254,14 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         return false
       }
 
-      // Typing barge-in: a new send silences any in-flight spoken reply.
-      if (isVoicePlaybackActive()) {
+      // Typing barge-in: a new send silences any in-flight spoken reply, and
+      // latches the interruption note the backend stamps onto `prompt.submit`.
+      // `voice.barge_in: false` opts out of both — the same key that disarms the
+      // mic barge listener (`ensureBargeMonitor`) and the gateway's
+      // `_arm_barge_listener_if_enabled`. With the cut skipped the readout keeps
+      // going and `use-auto-speak-replies` holds the next reply behind the
+      // playback-idle edge, so nothing overlaps.
+      if ($bargeInEnabled.get() && isVoicePlaybackActive()) {
         markVoicePlaybackInterrupted()
         stopVoicePlayback()
       }
