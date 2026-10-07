@@ -2,7 +2,7 @@
 ``begin_iteration`` (pending redirect, interrupt / review-budget / iteration-budget exits),
 ``prepare_iteration`` (``agent:step`` callback, skill-nudge counter, pre-API ``/steer`` drain as a
 standalone user row after the newest tool result, run-budget wrap-up notice, tool_call
-argument sanitization, interrupt-scaffold ghost-row drop, role-alternation repair),
+argument sanitization, interrupt-placeholder ghost-row neutralisation, role-alternation repair),
 ``announce_api_call`` (verbose summary / quiet spinner) and, after the retry loop,
 ``apply_retry_restarts`` (consumes the ``TurnRetryState`` restart flags). Nothing here
 imports ``agent.conversation_loop`` at module level (cycle)."""
@@ -14,8 +14,9 @@ import random
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
+from agent.agent_runtime_helpers_placeholders import _LEGACY_INTERRUPTED_PLACEHOLDER, hidden_interrupt_row
 from agent.display import KawaiiSpinner
 from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason
 from agent.turn_context_compaction import _reanchor
@@ -110,15 +111,94 @@ class IterationPrep:
     current_turn_user_idx: Any
 
 
+# Retire interrupt placeholders (hidden rows, and replies that already echoed one) whose text the model
+# echoes on replay (#81841 for the scaffold, #132949 for the placeholder). A hidden row still
+# reaches the provider as assistant content; a natural-language phrase in that
+# position is reproduced verbatim. A row followed by another assistant row is dropped: its
+# neighbours alternate without it, and kept it would be folded into that reply and hide it.
+# Otherwise it is the only thing between ``tool -> user`` (#48879) or ``user -> user`` (which
+# repair merges, losing the second row's checkpoint ``api_content``), so a copy is neutralised.
+def _neutralise_replay_echo_ghosts(seq: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """(new list, neutralised); never mutates ``seq`` or its row dicts."""
+    from agent.conversation_loop import _INTERRUPT_SCAFFOLD_MARKER  # late: conversation_loop imports this module
+    # Retire only spellings that predate the #132949 wording change: the scaffold
+    # (#81841) and the old placeholder, both reproduced verbatim. The current
+    # placeholder is the post-fix value — it stays (this is also what
+    # neutralisation rewrites to, so the rewrite does not retrigger the filter).
+    hazards = {_INTERRUPT_SCAFFOLD_MARKER, _LEGACY_INTERRUPTED_PLACEHOLDER}
+    # Runs every iteration over the whole transcript: only short bodies can be a placeholder (the
+    # slack tolerates surrounding whitespace), so long replies are rejected before ``strip()`` copies
+    # them, and the list is copied only once a row actually needs neutralising.
+    max_len = max(map(len, hazards)) + 64
+    from agent.agent_runtime_helpers import _remember_own_row, _retire_leading_drops  # late: heavy facade
+    from agent.conversation_compression_archive import ABSORBED_ROW_IDS, RETIRED_DURABLE_ROWS
+    from run_agent import AIAgent
+
+    def isolated(row: Dict[str, Any]) -> Dict[str, Any]:
+        # Copy with fresh retirement lists: the bookkeeping below must not reach the stored dict.
+        return {**row, **{k: list(row[k]) for k in (ABSORBED_ROW_IDS, RETIRED_DURABLE_ROWS)
+                          if isinstance(row.get(k), list)}}
+
+    def reaches_wire_after(i: int) -> bool:
+        # The assistant run after *i* holds a row the request keeps (the same thinking-only test the
+        # request filter drops by); repair would fold the whole run into a kept placeholder and hide it.
+        for nxt in seq[i + 1:]:
+            if not isinstance(nxt, dict) or nxt.get("role") != "assistant":
+                return False
+            if nxt.get("tool_calls") or (not AIAgent._is_thinking_only_assistant(nxt)
+                                         and AIAgent._content_has_real_payload(nxt.get("content"))):
+                return True
+        return False
+
+
+    out: List[Dict[str, Any]] | None = None
+    dropped: List[Dict[str, Any]] = []
+    neutralised = 0
+    for i, m in enumerate(seq):
+        if dropped and m.get("role") == "assistant":
+            # The reply right after a dropped durable placeholder stands for its row, as repair's own
+            # drops do; unnamed, an in-place compaction would re-sequence it behind the running turn.
+            m = isolated(m)
+            _retire_leading_drops([m], dropped)
+            dropped = []
+        # Hidden placeholders AND the visible replies a model already echoed them into: either one
+        # replayed seeds the next echo. A row with tool calls is real model output, never a placeholder.
+        if (
+            m.get("role") == "assistant" and not m.get("tool_calls")
+            and any(
+                isinstance(v := m.get(k), str) and len(v) <= max_len and v.strip() in hazards
+                for k in ("content", "api_content")
+            )
+        ):
+            if out is None:
+                out = list(seq[:i])
+            neutralised += 1
+            # Only an assistant run that reaches the wire replaces it: thinking-only rows alone are
+            # dropped from the request copy, which would leave the ``tool -> user`` pair it prevents.
+            if reaches_wire_after(i):
+                dropped.append(m)
+                continue
+            # The hidden placeholder shape, also for an echoed visible reply (content cleared, so it
+            # is not rendered as an empty bubble). Provider-native text carriers (Responses message
+            # items, Bedrock blocks) replace content at request build and would replay the legacy text.
+            row = isolated(m)
+            _remember_own_row(row)  # its text changes: an id-less reload still names its row
+            row.update(hidden_interrupt_row())
+            row.pop("codex_message_items", None)
+            row.pop("bedrock_content_blocks", None)
+            out.append(row)
+        elif out is not None:
+            out.append(m)
+    return (seq if out is None else out), neutralised
+
+
 def prepare_iteration(
     agent: Any, *, messages: Any, api_call_count: Any, user_message: Any = None, current_turn_user_idx: Any = None,
 ) -> IterationPrep:
     """Prepare ``messages`` for this iteration in the original order. Every mutation here is
     cache-safe by construction: steer text is appended as a new (not yet persisted) user row, the ghost-row
-    filter only drops hidden scaffold placeholders, and repair runs BEFORE the request build."""
-    from agent.conversation_loop import (
-        _INTERRUPT_SCAFFOLD_MARKER, _maybe_inject_run_budget_wrapup
-    )
+    filter neutralises copies of hidden interrupt placeholders, and repair runs BEFORE the request build."""
+    from agent.conversation_loop import _maybe_inject_run_budget_wrapup
 
     # nous.anthropic_wire=auto: a wire switch decided from the previous response lands here,
     # before this iteration's request is built and with nothing in flight.
@@ -180,19 +260,12 @@ def prepare_iteration(
             agent.session_id or "-",
         )
 
-    # Drop legacy hidden assistant placeholders carrying the raw interrupt scaffold
-    # before repair: replayed, the model echoes/self-replicates.
-    def _is_scaffold_ghost(msg: Dict[str, Any]) -> bool:
-        return (
-            msg.get("display_kind") == "hidden"
-            and msg.get("role") == "assistant"
-            and any(
-                isinstance(msg.get(k), str) and msg[k].strip() == _INTERRUPT_SCAFFOLD_MARKER
-                for k in ("content", "api_content")
-            )
+    messages, _echo_neutralised = _neutralise_replay_echo_ghosts(messages)
+    if _echo_neutralised:
+        request_logger.info(
+            "Neutralised %d interrupt-placeholder row(s) before request (session=%s)",
+            _echo_neutralised, agent.session_id or "-",
         )
-
-    messages = [msg for msg in messages if not _is_scaffold_ghost(msg)]
 
     # Repair malformed role alternation (tool→user / user→user tails): providers
     # return empty content on them and the empty-retry loop spins. The _with_cursor

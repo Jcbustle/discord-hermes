@@ -11,6 +11,7 @@ mergeAdjacentUserMessages in src/utils/messages.ts). See #16823 for the
 backstory on why the alternative — fabricating "." stub text — was rejected.
 """
 
+from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
 from run_agent import AIAgent
 
 
@@ -59,7 +60,7 @@ class TestIsThinkingOnlyAssistant:
         # on a model turn.
         healed = {
             "role": "assistant",
-            "content": "[response interrupted]",
+            "content": _INTERRUPTED_PLACEHOLDER,
             "_thinking_prefill": True,
         }
         assert AIAgent._is_thinking_only_assistant(healed)

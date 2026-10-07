@@ -14,6 +14,7 @@ import re
 from functools import partial
 from typing import Any, Callable
 
+from agent.agent_runtime_helpers_placeholders import hidden_interrupt_row
 from agent.message_metadata import DB_ROW_SNAPSHOT
 from agent.vision_message_prep import _provider_model_key
 
@@ -288,14 +289,23 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     """Append a synthetic assistant turn when an interrupted tail is a tool result: a transcript
     ending on a raw ``tool`` message makes the next user message land as ``tool → user``, an
     alternation violation strict providers (Gemini, Claude) answer by hallucinating a
-    continuation. Mutates in place; True if a closing turn was appended."""
+    continuation. Mutates in place; True if a closing turn was appended.
+
+    With no real text the close is ``hidden_interrupt_row()``: nothing rendered, the
+    placeholder on the wire (substituted at API-build time). A caller-supplied banner
+    (truncation notices, partial-delivery text) stays visible: it is the turn's only
+    user-facing explanation."""
     last = messages[-1] if messages else None
     if not isinstance(last, dict) or last.get("role") != "tool":
         return False
     text = final_response if isinstance(final_response, str) else ""
     from agent.message_metadata import append_message
 
-    append_message(messages, {"role": "assistant", "content": text.strip() or "Operation interrupted."})
+    stripped = text.strip()
+    if not stripped:
+        append_message(messages, hidden_interrupt_row())
+    else:
+        append_message(messages, {"role": "assistant", "content": stripped})
     return True
 
 
