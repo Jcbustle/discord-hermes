@@ -26,6 +26,18 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
+
+# ~/.hermes as a data directory (not just config.yaml/.env): the agent's own
+# state.db, sessions/, memories/, plugins/. Resolved absolute HERMES_HOME
+# subpaths fold to ~/.hermes/ at detection time, so one static fragment
+# covers default, relocated, and $HERMES_HOME spellings (#109367).
+# ponytail: prompt-grade (DANGEROUS), not hardline, except bare-home rm.
+_HERMES_HOME_PATH = (
+    r'(?:~/\.hermes|'
+    r'(?:\$home|\$\{home\})/\.hermes|'
+    r'(?:\$hermes_home|\$\{hermes_home\}))'
+    r'(?=[\s\"\'`;|&<>()/$]|$)'
+)
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
@@ -112,6 +124,12 @@ HARDLINE_PATTERNS = [
     (_RM_FLAG_PREFIX + _hardline_rm_path(r'/(?:(?:\.\.?)?/)*(?:\.\.?)?\**|/ \*'), "recursive delete of root filesystem"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(_HARDLINE_SYSTEM_DIRS), "recursive delete of system directory"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(r'(?:~|\$\{?HOME\}?)(?:/?|/\*)?'), "recursive delete of home directory"),
+    # The active agent home is not disposable scratch: rm -rf on the bare
+    # ~/.hermes / $HERMES_HOME (or the resolved absolute home, folded to
+    # ~/.hermes by _rewrite_resolved_hermes_home) sits below the yolo floor.
+    # ponytail: bare home only; child paths (cache prune, log rotate) stay
+    # prompt-grade via DANGEROUS so legit maintenance is not bricked.
+    (_RM_FLAG_PREFIX + _hardline_rm_path(r'(?:~/\.hermes|\$\{?HOME\}?/\.hermes|\$\{?HERMES_HOME\}?)(?:/?|/\*)?'), "recursive delete of active Hermes home"),
     # Command-name rules (mkfs, dd, kill, shutdown...) are _CMDPOS-anchored so quoted prose
     # (`echo "does this use mkfs?"`) cannot trip the floor.
     # See #93392.
@@ -418,6 +436,15 @@ DANGEROUS_PATTERNS = [
     # with auto-approve. Same unpaired-door rationale as #14639 / the sed-tee-redirect pairing on these
     # targets. `authorized_keys` after the `~/.ssh/` fragment).
     (rf'\b(cp|mv|install)\b.*\s["\']?{_SENSITIVE_WRITE_TARGET}[^\s"\']*["\']?{_COMMAND_TAIL}', "copy/move file into sensitive credential/SSH/shell-rc path"),
+    # Hermes-home floor (#109367): destructive verbs scoped to the agent's own
+    # data dir. Read-only access (cat/cp-FROM, sqlite3 mode=ro, session_search)
+    # stays clean; writes/moves/deletes prompt instead of silent-approve.
+    # ponytail: one alternation, not per-verb rules; SQL predicate smarts skipped.
+    (rf'\brm\b[^\n]*?\s["\']?{_HERMES_HOME_PATH}[^\s"\']*', "delete Hermes home data (rm)"),
+    (rf'\b(mv|truncate|shred|unlink)\b[^\n]*?\s["\']?{_HERMES_HOME_PATH}[^\s"\']*', "destructive move/wipe of Hermes home data"),
+    (rf'\btee\b[^\n]*?\s["\']?{_HERMES_HOME_PATH}[^\s"\']*', "overwrite Hermes home data via tee"),
+    (rf'>>?\s*["\']?{_HERMES_HOME_PATH}[^\s"\']*', "overwrite Hermes home data via redirection"),
+    (rf'\bcp\b[^\n]*?/dev/(null|zero)\b[^\n]*?\s["\']?{_HERMES_HOME_PATH}[^\s"\']*["\']?{_COMMAND_TAIL}', "wipe Hermes home data via copy from /dev/null"),
     # In-place edits mutate the file directly, bypassing redirection/tee/cp coverage; gate the same
     # startup/credential files.
     (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
@@ -566,7 +593,13 @@ def _home_prefix_fold_regex(path: str):
     if len(components) < 2:
         return None
     # Optional leading root separator; a Windows drive letter is a component.
-    return re.compile(r"[/\\]*" + r"[/\\]+".join(re.escape(c) for c in components) + _PATH_TAIL)
+    # IGNORECASE: Windows resolves paths case-insensitively (``c:\opt\data`` and
+    # ``C:\OPT\DATA`` are one directory) and Git Bash / PowerShell / cmd all
+    # accept a lowercase drive letter, so a case variant of the resolved home is
+    # the same directory the floor must cover. On POSIX this only ever
+    # over-folds (a differently-cased path folds to ``~``), which is
+    # over-blocking — the safe direction for a floor that yolo cannot bypass.
+    return re.compile(r"[/\\]*" + r"[/\\]+".join(re.escape(c) for c in components) + _PATH_TAIL, re.IGNORECASE)
 
 
 def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
@@ -579,6 +612,29 @@ def _fold_home_prefixes(command: str, paths, replacement: str) -> str:
     return command
 
 
+def _fold_exact_home_paths(command: str, paths, replacement: str) -> str:
+    """Fold exact resolved home path tokens without folding child paths."""
+    # ponytail: exact tokens only; subpaths already folded by _fold_home_prefixes.
+    # ``*`` / ``/`` / ``\\`` in the boundary let a suffixed token (``<home>/*``,
+    # ``<home>/state.db``) fold too; the lookahead is zero-width so the suffix is
+    # preserved. IGNORECASE because a case variant of the home is the same
+    # directory on Windows (see _home_prefix_fold_regex).
+    boundary = r"""(?=$|[\s'"\`;|&<>()/*\\])"""
+    seen: set[str] = set()
+    for path in sorted((p for p in paths if p), key=len, reverse=True):
+        for variant in {path, path.replace("\\", "/"), path.replace("/", "\\")}:
+            if not variant or variant in seen:
+                continue
+            seen.add(variant)
+            command = re.sub(
+                re.escape(variant) + boundary,
+                replacement,
+                command,
+                flags=re.IGNORECASE,
+            )
+    return command
+
+
 def _rewrite_resolved_user_home(command: str) -> str:
     """User home (expanduser / realpath / $HOME) -> ``~/``; no-op when unset, degenerate, or unresolvable."""
     try:
@@ -587,7 +643,13 @@ def _rewrite_resolved_user_home(command: str) -> str:
         paths = [home, os.path.realpath(home), os.environ.get("HOME", "")]
     except Exception:
         return command
-    return _fold_home_prefixes(command, paths, "~")
+    command = _fold_home_prefixes(command, paths, "~")
+    # Bare ``rm -rf C:\Users\alice`` is the same destructive act as ``rm -rf ~``
+    # but has no child path for the prefix fold's tail anchor, so it stayed
+    # prompt-grade — silently auto-approved under yolo while the ``~`` spelling
+    # was hardline-blocked. Fold the bare exact token too (same helper the
+    # resolved Hermes home uses below).
+    return _fold_exact_home_paths(command, paths, "~")
 
 
 def _rewrite_resolved_hermes_home(command: str) -> str:
@@ -599,7 +661,8 @@ def _rewrite_resolved_hermes_home(command: str) -> str:
         paths = [str(home), str(home.resolve(strict=False))]
     except Exception:
         return command
-    return _fold_home_prefixes(command, paths, "~/.hermes")
+    command = _fold_home_prefixes(command, paths, "~/.hermes")
+    return _fold_exact_home_paths(command, paths, "~/.hermes")
 
 
 _PARAM_REPLACEMENT_RE = re.compile(r"\$\{[^}/\s]+/[^}/]*/(?P<replacement>[^}]*)\}")

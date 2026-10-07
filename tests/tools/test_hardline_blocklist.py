@@ -700,3 +700,99 @@ def test_sudo_stdin_guard_container_bypass(clean_session):
         for cmd in _SUDO_STDIN_BLOCK:
             result = check_all_command_guards(cmd, env)
             assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"
+
+
+# #109367: the active Hermes home is the agent's own data dir — bare-home
+# recursive delete sits below the yolo floor. Children (cache prune, log
+# rotate) stay prompt-grade via DANGEROUS, not hardline.
+_HERMES_HOME_HARDLINE_BLOCK = [
+    "rm -rf ~/.hermes",
+    "rm -rf ~/.hermes/",
+    "rm -rf ~/.hermes/*",
+    "rm -rf $HERMES_HOME",
+    "rm -rf ${HERMES_HOME}",
+    'rm -rf "$HERMES_HOME"',
+    "rm -fr ~/.hermes",
+]
+
+
+@pytest.mark.parametrize("command", _HERMES_HOME_HARDLINE_BLOCK)
+def test_hermes_home_bare_delete_is_hardline(command):
+    is_hl, desc = detect_hardline_command(command)
+    assert is_hl, f"expected hardline to match {command!r}"
+    assert desc == "recursive delete of active Hermes home"
+
+
+@pytest.mark.parametrize("command", [
+    "rm -rf ~/.hermes/cache",
+    "rm -rf $HERMES_HOME/cache",
+    "rm -rf ~/.hermes-backup",
+])
+def test_hermes_home_child_is_not_hardline(command):
+    is_hl, desc = detect_hardline_command(command)
+    assert not is_hl, f"child path must not hit the floor: {command!r} ({desc})"
+    assert desc is None
+
+
+def test_resolved_hermes_home_is_hardline_blocked(monkeypatch, tmp_path):
+    active_home = tmp_path / "custom-hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+    for command in (
+        f"rm -rf {active_home}",
+        f'rm -rf "{active_home}"',
+        f"rm -rf {active_home}/",
+        f"rm -rf {active_home}/*",
+        # Windows resolves paths case-insensitively, so a case variant is the
+        # same directory the floor must cover (a bare tmp_path would be
+        # case-consistent and prove nothing).
+        f"rm -rf {str(active_home).swapcase()}",
+        f"rm -rf {str(active_home).swapcase()}/*",
+    ):
+        is_hl, desc = detect_hardline_command(command)
+        assert is_hl, command
+        assert desc == "recursive delete of active Hermes home"
+
+
+# #127475 review follow-up: the resolved *user* home needs the same exact-token
+# fold as the Hermes home. Bare ``rm -rf C:\Users\tester`` had no child path
+# for the prefix fold's tail anchor, so it stayed prompt-grade — frozen yolo
+# silently approved the absolute spelling while ``rm -rf ~`` was hardline.
+def test_resolved_user_home_is_hardline_blocked(monkeypatch):
+    monkeypatch.setenv("HOME", r"C:\Users\tester")
+    for command in (
+        r"rm -rf C:\Users\tester",
+        r"rm -rf c:\users\tester",
+        r"rm -rf C:\Users\TESTER",
+        r'rm -rf "C:\Users\tester"',
+        r"rm -rf C:\Users\tester; echo done",
+    ):
+        is_hl, desc = detect_hardline_command(command)
+        assert is_hl, command
+        assert desc == "recursive delete of home directory"
+
+    monkeypatch.setenv("HOME", "/home/tester")
+    for command in ("rm -rf /home/tester", "rm -rf /HOME/TESTER"):
+        is_hl, desc = detect_hardline_command(command)
+        assert is_hl, command
+        assert desc == "recursive delete of home directory"
+
+
+def test_resolved_user_home_siblings_not_folded(monkeypatch):
+    """``tester2`` / ``tester-backup`` are different dirs and stay off the floor."""
+    monkeypatch.setenv("HOME", r"C:\Users\tester")
+    for command in (
+        r"rm -rf C:\Users\tester2",
+        r"rm -rf C:\Users\tester-backup",
+        "rm -rf /home/tester2",
+    ):
+        is_hl, _ = detect_hardline_command(command)
+        assert not is_hl, command
+
+
+def test_yolo_cannot_bypass_resolved_user_home_delete(clean_session, monkeypatch):
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    monkeypatch.setenv("HOME", r"C:\Users\tester")
+    for cmd in (r"rm -rf C:\Users\tester", r"rm -rf c:\users\tester"):
+        result = check_all_command_guards(cmd, "local")
+        assert result["approved"] is False, cmd
+        assert result.get("hardline") is True

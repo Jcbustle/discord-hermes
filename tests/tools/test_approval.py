@@ -2177,3 +2177,64 @@ class TestLifecycleGuardLaunchctlParity:
             "launchctl print system/com.apple.WindowServer",
         ):
             assert contains_gateway_lifecycle_command(cmd) is False, cmd
+
+
+class TestHermesHomeDestructiveVerbs:
+    """#109367: destructive verbs scoped to HERMES_HOME must prompt.
+
+    Bare-home `rm -rf` is hardline (see test_hardline_blocklist.py); every
+    other destructive idiom against the agent's own data dir must at least
+    reach the approval gate instead of silent-approve. Read-only access
+    (cat, cp-FROM, tee elsewhere) stays clean.
+    """
+
+    def test_destructive_verbs_against_hermes_home_prompt(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+        home = str(tmp_path / "hh")
+        for command in (
+            "mv ~/.hermes /tmp/x",
+            f"mv {home} /tmp/x",
+            "rm ~/.hermes/state.db",
+            f"rm {home}/state.db",
+            "rm -rf ~/.hermes/cache",
+            "> ~/.hermes/state.db",
+            "truncate -s0 ~/.hermes/state.db",
+            "shred -u ~/.hermes/state.db",
+            "unlink ~/.hermes/state.db",
+            "echo x | tee ~/.hermes/state.db",
+            "cp /dev/null ~/.hermes/state.db",
+            "mv $HERMES_HOME /tmp/x",
+            # Case variant of the resolved home: same directory on Windows.
+            f"rm {str(tmp_path / 'hh').swapcase()}/state.db",
+        ):
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key is not None, command
+
+    def test_reads_and_forensics_copies_stay_clean(self):
+        for cmd in (
+            "cat ~/.hermes/config.yaml",
+            "cp ~/.hermes/state.db /tmp/backup",
+            "echo hello | tee /tmp/output.txt",
+            "echo data > /tmp/scratch.txt",
+            "rm foo.txt",
+        ):
+            dangerous, key, desc = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
+
+
+class TestWindowsAbsolutePathFoldingCaseVariants:
+    """#127475: a swapcased resolved home with a backslash child tail stays gated.
+
+    End-to-end outcome guard: every fold layer runs case-insensitively and the
+    Windows-path detection variant flattens backslashes before the fold, so a
+    case-variant spelling of a sensitive write cannot silently drop out of the
+    approval gate.
+    """
+
+    def test_swapcased_home_with_backslash_child_still_folds(self, monkeypatch):
+        monkeypatch.setenv("HOME", r"C:\Users\tester")
+        cmd = ("cat key >> " + r"C:\Users\tester\.ssh\authorized_keys").swapcase()
+        dangerous, key, _ = detect_dangerous_command(cmd)
+        assert dangerous is True, cmd
+        assert key is not None, cmd
