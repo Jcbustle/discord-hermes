@@ -3867,3 +3867,16 @@ tips:
     p09: "Explica este error y cómo solucionarlo"
     p10: "Crea un recordatorio o programa una tarea recurrente"
     p11: "Escribe / para explorar los comandos, o Ctrl+P para la paleta"
+
+translate:
+  header: "🌐 Traducción ({target}) — generada automáticamente, original abajo."
+  original_label: "Original:"
+  uncertain_note: "⚠️ Traducción aproximada — verifica con el original."
+  usage: "Uso: /translate [--to LANG] [texto] | /translate on|off|status"
+  no_source: "Nada que traducir — pasa un texto o ejecuta antes un comando."
+  auto_on: "Traducción automática ACTIVADA (destino: {target})."
+  auto_off: "Traducción automática DESACTIVADA."
+  auto_inactive: "Nota: todavía no hay ningún renderizado automático conectado — usa /translate para traducir un bloque."
+  target_set: "Idioma de destino: {target}."
+  status: "Idioma de destino: {target}; automática: {mode}."
+  failed: "Error de traducción: {error}"

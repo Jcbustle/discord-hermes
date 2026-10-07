@@ -3867,3 +3867,16 @@ tips:
     p09: "이 오류를 설명하고 해결 방법을 알려 줘"
     p10: "리마인더를 설정하거나 반복 작업을 예약해 줘"
     p11: "/ 를 입력해 명령을 둘러보거나 Ctrl+P로 팔레트를 여세요"
+
+translate:
+  header: "🌐 Translation ({target}) — machine-rendered, original kept below."
+  original_label: "Original:"
+  uncertain_note: "⚠️ Rough translation — verify against the original."
+  usage: "Usage: /translate [--to LANG] [text] | /translate on|off|status"
+  no_source: "Nothing to translate — pass text or run a command first."
+  auto_on: "Automatic translation ON (target: {target})."
+  auto_off: "Automatic translation OFF."
+  auto_inactive: "Note: no automatic render hook is wired yet — use /translate to translate a block."
+  target_set: "Translation target: {target}."
+  status: "Translation target: {target}; automatic: {mode}."
+  failed: "Translation failed: {error}"

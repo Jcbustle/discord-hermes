@@ -3867,3 +3867,16 @@ tips:
     p09: "Erkläre diesen Fehler und wie ich ihn behebe"
     p10: "Richte eine Erinnerung ein oder plane eine wiederkehrende Aufgabe"
     p11: "Geben Sie / ein, um Befehle zu durchsuchen, oder Ctrl+P für die Palette"
+
+translate:
+  header: "🌐 Übersetzung ({target}) — maschinell erstellt, Original unten."
+  original_label: "Original:"
+  uncertain_note: "⚠️ Grobe Übersetzung — bitte am Original prüfen."
+  usage: "Verwendung: /translate [--to LANG] [Text] | /translate on|off|status"
+  no_source: "Nichts zu übersetzen — Text angeben oder zuerst einen Befehl ausführen."
+  auto_on: "Automatische Übersetzung EIN (Ziel: {target})."
+  auto_off: "Automatische Übersetzung AUS."
+  auto_inactive: "Hinweis: Es ist noch kein automatisches Rendering verdrahtet — nutze /translate für einen Block."
+  target_set: "Übersetzungsziel: {target}."
+  status: "Übersetzungsziel: {target}; automatisch: {mode}."
+  failed: "Übersetzung fehlgeschlagen: {error}"

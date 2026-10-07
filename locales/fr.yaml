@@ -4192,3 +4192,16 @@ tips:
     p09: "Explique cette erreur et comment la corriger"
     p10: "Définis un rappel ou planifie une tâche récurrente"
     p11: "Tapez / pour parcourir les commandes, ou Ctrl+P pour la palette"
+
+translate:
+  header: "🌐 Traduction ({target}) — rendu automatique, original conservé ci-dessous."
+  original_label: "Original :"
+  uncertain_note: "⚠️ Traduction approximative — vérifiez avec l'original."
+  usage: "Utilisation : /translate [--to LANG] [texte] | /translate on|off|status"
+  no_source: "Rien à traduire — indiquez un texte ou exécutez d'abord une commande."
+  auto_on: "Traduction automatique ACTIVÉE (cible : {target})."
+  auto_off: "Traduction automatique DÉSACTIVÉE."
+  auto_inactive: "Remarque : aucun rendu automatique n'est encore branché — utilisez /translate pour traduire un bloc."
+  target_set: "Langue cible de traduction : {target}."
+  status: "Langue cible de traduction : {target} ; automatique : {mode}."
+  failed: "Échec de la traduction : {error}"

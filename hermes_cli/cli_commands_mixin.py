@@ -1835,6 +1835,75 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
                           title_suffix=_t("btw.title_suffix"),
                           empty_note=f"  {_t('btw.no_answer')}").start()
 
+    def _handle_translate_command(self, cmd: str):
+        """Handle /translate -- render tool output or text in the user's language (#123591).
+
+        ``/translate [--to LANG] <text>`` translates explicit text, bare ``/translate``
+        renders the last output block, ``/translate on [LANG]|off|status`` manages the
+        per-session auto toggle (off by default). Code spans, paths and flags are
+        protected by :mod:`agent.translate` and come back verbatim; the original is
+        always kept alongside the translation."""
+        from agent import translate as _translate
+        from agent.i18n import t as _t
+        session = getattr(self, "session_id", None) or "default"
+        parts = _shlex_args(cmd)
+        parts, to_lang, ok = _take_flag(parts, "--to")
+        if not ok:
+            return _cp(f"  {_t('translate.usage')}")
+        head = parts[0].lower() if parts else ""
+        if head == "status" and len(parts) == 1 and not to_lang:
+            target = _translate.effective_target(session, None)
+            mode = "on" if _translate.auto_enabled(session) else "off"
+            return _cp(f"  {_t('translate.status', target=target, mode=mode)}")
+        if head == "off" and len(parts) == 1 and not to_lang:
+            _translate.set_auto(session, False)
+            return _cp(f"  {_t('translate.auto_off')}")
+        if head == "on" and len(parts) <= 2:
+            if to_lang or len(parts) == 2:
+                _translate.set_target(session, to_lang or parts[1])
+            _translate.set_auto(session, True)
+            target = _translate.effective_target(session, None)
+            return _cp(f"  {_t('translate.auto_on', target=target)}",
+                        f"  {_t('translate.auto_inactive')}")
+        if to_lang and not parts:
+            _translate.set_target(session, to_lang)
+            return _cp(f"  {_t('translate.target_set', target=_translate.effective_target(session, None))}")
+        text = " ".join(parts).strip()
+        if not text:
+            import cli as _cli_mod
+            tail = [str(e) for e in _cli_mod._OUTPUT_HISTORY if str(e).strip()]
+            window = tail[-30:]
+            text = "\n".join(window).strip()
+            # The window can start inside a code block whose opener fell off the
+            # slice; agent.translate pairs fence markers from the start of the text,
+            # so extend left until the markers count is even and the snippet begins
+            # outside any fence (a block still open at the end is truncated at the
+            # same place in the history — that pairing covers it).
+            k = len(tail) - len(window)
+            while k > 0 and (text.count("```") % 2 or text.count("~~~") % 2):
+                k -= 1
+                window = tail[k:]
+                text = "\n".join(window).strip()
+        if not text:
+            return _cp(f"  {_t('translate.no_source')}",
+                        f"  {_t('translate.usage')}")
+        if not self._ensure_runtime_credentials():
+            return _cp("  (>_<) Cannot translate: no valid credentials.")
+        target = _translate.effective_target(session, to_lang)
+        preview = _ellipsize(text, 60)
+
+        def produce():
+            try:
+                result = _translate.translate_text(text, target=target, session_id=session)
+            except Exception as exc:
+                return f"  {_t('translate.failed', error=exc)}"
+            return _translate.render_translation(result)
+
+        self._side_worker(produce, name="translate-side", fail_label="/translate",
+                          header_lines=[f"  🌐 /translate → {target}: \"{preview}\""],
+                          title_suffix="(translate)",
+                          empty_note=f"  {_t('translate.no_source')}").start()
+
     # ---- /bundles, /browser ---------------------------------------------------------------
     def _handle_bundles_command(self, cmd: str) -> None:
         """In-session ``/bundles`` — show installed skill bundles (``hermes bundles list`` rendered
