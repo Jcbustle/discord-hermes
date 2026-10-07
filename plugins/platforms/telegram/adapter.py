@@ -26,20 +26,6 @@ from gateway.platforms._shared import (
 )
 
 
-def _redact_telegram_error_text(error: object) -> str:
-    """Redact secrets from Telegram transport errors before logging or returning them."""
-    text = "" if error is None else str(error)
-    if not text:
-        # httpx timeout exceptions (ConnectTimeout, ReadTimeout, ...) stringify to "" — keep the
-        # class name so failure lines never log an empty reason (#111211).
-        return f"<{type(error).__name__}>" if error is not None else text
-    try:
-        from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(text, force=True)
-    except Exception:
-        return "<telegram error redacted>"
-
-
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
@@ -178,11 +164,13 @@ _MEDIA_KIND_KEYS = {
     "video file": "platform.telegram.media.kind_video"}
 
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.slash_access import exec_approval_tap_allowed
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
-    SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
+    SEED_FALLBACK_IPS, TelegramFallbackTransport, _redact_telegram_error_text, discover_fallback_ips, parse_fallback_ip_env,
+    tcp_keepalive_socket_options)
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -4728,11 +4716,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         except (ValueError, IndexError):
             await query.answer(text=_toast("platform.telegram.approval.toast_invalid_data"))
             return
+        # Peek, not pop: a tap the opt-in admin gate refuses leaves the approval pending for an admin.
         session_key = await self._claim_callback_state(
             query, cb, self._approval_state, approval_id, _unauthorized(),
-            _toast("platform.telegram.approval.toast_already_resolved"))
+            _toast("platform.telegram.approval.toast_already_resolved"), pop=False)
         if not session_key:
             return
+        if not exec_approval_tap_allowed(self.config.extra, getattr(query.from_user, "id", None), "Telegram"):
+            return await query.answer(text=_unauthorized())
+        self._approval_state.pop(approval_id, None)  # no await since the peek: concurrent taps resolve once
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
         # Resolve FIRST (unblocks the agent thread), render after: a tap landing after the wait timed out
         # (count == 0) must NOT claim "Approved" — the command was already denied.
