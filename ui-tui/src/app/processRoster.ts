@@ -2,6 +2,8 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { useMemo } from 'react'
 
+import { getLocale, t as tr, useLocale, useT } from '../i18n/index.js'
+
 import { $uiState } from './uiStore.js'
 
 // Background `terminal(background=true)` processes owned by this session, as the
@@ -65,19 +67,28 @@ const lastOutputLine = (preview: string | undefined): string => {
   return ''
 }
 
-export const processVerdict = (row: ProcessRow, exitCode: number | null | undefined): string => {
+export const processVerdict = (
+  row: ProcessRow,
+  exitCode: number | null | undefined,
+  locale: string = getLocale()
+): string => {
   if (row.status === 'running') {
-    return row.detail ? `last: ${row.detail}` : 'starting'
+    return row.detail ? tr('process.last', row.detail) : tr('pickers.session.status.starting')
   }
 
-  const verdict = row.status === 'killed' || row.status === 'lost' ? row.status : `exit ${exitCode ?? '?'}`
+  const verdict =
+    row.status === 'killed' || row.status === 'lost' ? tr(`process.${row.status}`) : tr('process.exit', exitCode ?? '?')
 
-  return `${verdict} · ${row.sinceExitSeconds}s ago`
+  return tr('process.ago', verdict, row.sinceExitSeconds)
 }
 
 /** Running processes first (longest running first), then recently exited ones
  * newest-exit first; exits older than the retention window are dropped. */
-export const buildProcessRows = (processes: readonly ProcessEntry[], nowMs: number): ProcessRow[] => {
+export const buildProcessRows = (
+  processes: readonly ProcessEntry[],
+  nowMs: number,
+  locale: string = getLocale()
+): ProcessRow[] => {
   const nowS = nowMs / 1000
   const rows: ProcessRow[] = []
 
@@ -91,7 +102,7 @@ export const buildProcessRows = (processes: readonly ProcessEntry[], nowMs: numb
     }
 
     const row: ProcessRow = {
-      command: (entry.command ?? '').replace(/\s+/g, ' ').trim() || 'background process',
+      command: (entry.command ?? '').replace(/\s+/g, ' ').trim() || tr('process.background'),
       detail: lastOutputLine(entry.output_preview),
       elapsedSeconds: Math.max(0, entry.uptime_seconds ?? 0) - sinceExitSeconds,
       id: entry.session_id,
@@ -99,7 +110,7 @@ export const buildProcessRows = (processes: readonly ProcessEntry[], nowMs: numb
       status
     }
 
-    row.detail = processVerdict(row, entry.exit_code)
+    row.detail = processVerdict(row, entry.exit_code, locale)
     rows.push(row)
   }
 
@@ -117,6 +128,11 @@ export const buildProcessRows = (processes: readonly ProcessEntry[], nowMs: numb
 export function useProcessRows(nowMs: number): ProcessRow[] {
   const snapshot = useStore($processSnapshot)
   const { sid } = useStore($uiState)
+  const locale = useLocale()
+  useT()
 
-  return useMemo(() => buildProcessRows(snapshot.sid === sid ? snapshot.processes : [], nowMs), [snapshot, sid, nowMs])
+  return useMemo(
+    () => buildProcessRows(snapshot.sid === sid ? snapshot.processes : [], nowMs, locale),
+    [snapshot, sid, nowMs, locale]
+  )
 }

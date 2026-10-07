@@ -8025,6 +8025,18 @@
       "CommandCategory": {
         "additionalProperties": false,
         "properties": {
+          "key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Key"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -8283,6 +8295,13 @@
       "CommandsCatalogResult": {
         "additionalProperties": false,
         "properties": {
+          "description_keys": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Description Keys",
+            "type": "object"
+          },
           "pairs": {
             "items": {
               "items": {
@@ -8489,6 +8508,43 @@
             "default": "",
             "title": "Meta",
             "type": "string"
+          },
+          "meta_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Meta Key"
+          },
+          "meta_vars": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Meta Vars"
           },
           "kind": {
             "anyOf": [
@@ -14394,6 +14450,18 @@
             "title": "Replay Epoch",
             "type": "string"
           },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Language"
+          },
           "heartbeat": {
             "anyOf": [
               {
@@ -19753,6 +19821,43 @@
         "additionalProperties": false,
         "description": "``agent/credits_tracker.py::AgentNotice`` via notice_callback, and ``server._await_agent_ready``'s\nslow-build notice. ``level``: info | warn | error | success; ``kind``: sticky | ttl | agent.",
         "properties": {
+          "text_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Text Key"
+          },
+          "text_vars": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Text Vars"
+          },
           "text": {
             "title": "Text",
             "type": "string"
@@ -32087,6 +32192,65 @@
         "title": "SessionSetHiddenResult",
         "type": "object"
       },
+      "SessionStatusDetails": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "last_activity": {
+            "title": "Last Activity",
+            "type": "string"
+          },
+          "tokens": {
+            "title": "Tokens",
+            "type": "integer"
+          },
+          "agent_running": {
+            "title": "Agent Running",
+            "type": "boolean"
+          },
+          "project": {
+            "title": "Project",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "path",
+          "title",
+          "model",
+          "provider",
+          "created",
+          "last_activity",
+          "tokens",
+          "agent_running",
+          "project"
+        ],
+        "title": "SessionStatusDetails",
+        "type": "object"
+      },
       "SessionStatusParams": {
         "additionalProperties": false,
         "properties": {
@@ -32119,6 +32283,17 @@
           "output": {
             "title": "Output",
             "type": "string"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionStatusDetails"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -34629,6 +34804,43 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "text_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Text Key"
+          },
+          "text_vars": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Text Vars"
           },
           "text": {
             "title": "Text",
