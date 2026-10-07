@@ -2015,6 +2015,7 @@ export const esOverrides = {
       followTask: task => `Seguir ${task}`,
       providerDefault: '(predeterminado del proveedor)',
       fallbackAdd: 'Añadir respaldo',
+      overrideAdd: 'Añadir anulación de modelo',
       fallbackEmpty: 'No hay modelos de respaldo; se usa el modelo predeterminado salvo que falle.',
       notInCatalog: 'no está en la lista de modelos de este proveedor; las llamadas pueden recurrir a un respaldo.',
       moaTitle: 'Mixture of Agents',
