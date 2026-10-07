@@ -5980,6 +5980,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         _cid_str = str(chat_id)
         return self._pending_guest_queries.get(_cid_str) is not None or _cid_str in self._guest_only_chats
 
+    def exec_approval_unanswerable(self, source: Any) -> Optional[str]:
+        """A guest chat can't show an approval prompt: the card's sendMessage is rejected, the guest
+        send path keeps only the streamed reply, and /approve is declined there (any user, admin or not)."""
+        if self._is_guest_chat(getattr(source, "chat_id", None)):
+            return "this is a guest chat the bot isn't a member of, so approval can't be granted here. Tell the user you can't do that in this context."
+        return None
+
     def _telegram_exclusive_bot_mentions(self) -> bool:
         """Return whether explicit @...bot mentions exclusively route group messages."""
         return self._extra_bool("exclusive_bot_mentions", "TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true")
