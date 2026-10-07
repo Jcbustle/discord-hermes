@@ -217,3 +217,50 @@ toolsets:
     assert "kanban_complete" in names
     assert "kanban_list" not in names
     assert resolved != ["kanban"]
+
+
+def test_worker_pin_drops_cli_rejected_names(monkeypatch, tmp_path):
+    """Pinned --toolsets must not name CLI-rejected entries (#86394), while names
+    the CLI still resolves must survive the filter: legacy ``*_tools`` spellings
+    resolve via model_tools' _LEGACY_TOOLSET_MAP, and configured MCP servers are
+    exempted by the CLI resolver (review follow-up)."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "grace"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - terminal
+    - web_tools
+    - file_tools
+    - platform
+mcp_servers:
+  myserver:
+    command: ["true"]
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    resolved = kbd._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved is not None
+    # The internal ``platform`` name is CLI-rejected and must be dropped.
+    assert "platform" not in resolved
+    # Legacy spellings still resolve to real tools; dropping them hides tools.
+    for required in ("terminal", "web_tools", "file_tools", "myserver"):
+        assert required in resolved, f"lost pin entry: {required}"
+
+    from model_tools import _LEGACY_TOOLSET_MAP, get_tool_definitions
+    from toolsets import validate_toolset
+
+    assert all(
+        validate_toolset(t) or t in _LEGACY_TOOLSET_MAP or t == "myserver" for t in resolved
+    )
+    names = {t["function"]["name"] for t in get_tool_definitions(
+        [t for t in resolved if t != "myserver"], quiet_mode=True, skip_tool_search_assembly=True)}
+    assert "web_search" in names, "web_tools entry must keep resolving"
+    assert "read_file" in names, "file_tools entry must keep resolving"

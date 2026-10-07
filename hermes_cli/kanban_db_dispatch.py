@@ -2697,11 +2697,18 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
     try:
         from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import _get_platform_tools, enabled_mcp_server_names
+        from model_tools import _LEGACY_TOOLSET_MAP
+        from toolsets import validate_toolset
 
         with _worker_profile_scope(hermes_home):
             cfg = load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
+        # Pin must stay CLI-selectable; unknown names only warn at worker boot (#86394).
+        # Legacy ``*_tools`` spellings still resolve through model_tools' map and must
+        # survive, or the worker silently loses real tools (review follow-up).
+        selectable = set(enabled_mcp_server_names(cfg)) | set(_LEGACY_TOOLSET_MAP)
+        toolsets = [t for t in toolsets if validate_toolset(t) or t in selectable]
         return toolsets or None
     except Exception as exc:
         _kb._log.debug(
