@@ -11,7 +11,7 @@ import tempfile
 import tomllib
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -132,8 +132,8 @@ def require_smokes_match_claim(manifest: dict, *, skip_tests: bool) -> None:
 def stable_windows_version(epoch: object) -> str:
     if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
         raise ValueError("Stable release epoch must be a non-negative integer")
-    instant = datetime.fromtimestamp(epoch, tz=timezone.utc)
-    start = datetime(instant.year, 1, 1, tzinfo=timezone.utc)
+    instant = datetime.fromtimestamp(epoch, tz=UTC)
+    start = datetime(instant.year, 1, 1, tzinfo=UTC)
     hour_of_year = (instant - start).days * 24 + instant.hour
     second_of_hour = instant.minute * 60 + instant.second
     return f"{instant.year}.{hour_of_year}.{second_of_hour}.0"

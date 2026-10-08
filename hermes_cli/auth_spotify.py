@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import uuid
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode, urlparse
 from hermes_cli.auth_constants import (
@@ -124,9 +124,9 @@ def _spotify_token_payload_to_state(
     accounts_base_url: str, api_base_url: str, previous_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     from hermes_cli.auth import _coerce_ttl_seconds
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     expires_in = _coerce_ttl_seconds(token_payload.get("expires_in", 0))
-    expires_at = datetime.fromtimestamp(now.timestamp() + expires_in, tz=timezone.utc)
+    expires_at = datetime.fromtimestamp(now.timestamp() + expires_in, tz=UTC)
     state = dict(previous_state or {})
     state.update({
         "client_id": client_id, "redirect_uri": redirect_uri,

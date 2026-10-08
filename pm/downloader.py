@@ -217,7 +217,7 @@ def replace_when_released(tmp: Path, dest: Path, *, timeout: float = _RELEASE_WA
             delay = min(delay * 2, 2.0)
 
 
-def _existing_dest_ok(source: "Source") -> bool:
+def _existing_dest_ok(source: Source) -> bool:
     """Pinned destinations are rehashed; unpinned model files are accepted as-is.
 
     Catalog policy does not supply their expected hash or stable length.

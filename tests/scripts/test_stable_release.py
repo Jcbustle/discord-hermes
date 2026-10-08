@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 
 import pytest
@@ -30,7 +30,7 @@ def candidates(tag, commit, digest, archive=None):
     manifest itself names; the payload `tag` stays plain vX.Y.Z."""
     packages = []
     second = 100 + int(tag.rsplit('.', 1)[1])
-    release_epoch = int((datetime(2026, 8, 29, 1, 0, tzinfo=timezone.utc)
+    release_epoch = int((datetime(2026, 8, 29, 1, 0, tzinfo=UTC)
                          + timedelta(seconds=second)).timestamp())
     native_version = f"2026.5761.{second}.0"
     ref = archive or tag
@@ -292,8 +292,8 @@ def https_origin(tmp_path, monkeypatch):
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
     cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
             .public_key(key.public_key()).serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
-            .not_valid_after(datetime.datetime(2099, 1, 1, tzinfo=datetime.timezone.utc))
+            .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
+            .not_valid_after(datetime.datetime(2099, 1, 1, tzinfo=datetime.UTC))
             .add_extension(x509.SubjectAlternativeName([
                 x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
             ]), critical=False).sign(key, hashes.SHA256()))
