@@ -169,6 +169,7 @@ export interface Translations extends NoticeTranslations {
         serverNeedsAuth: string
         serverOff: string
         serverOn: string
+        serverOnDemand: string
         serverOnUnused: string
       }
       fact: {
