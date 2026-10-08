@@ -12,6 +12,7 @@ Covers the bundled plugin at ``plugins/disk-cleanup/``:
   * Bundled-plugin discovery via ``PluginManager.discover_and_load``.
 """
 
+import concurrent.futures
 import importlib
 import itertools
 import json
@@ -316,6 +317,75 @@ class TestProtectedDirsNeverRmtreed:
         assert new_att.exists(), "kanban files a call created are never tracked or deleted"
         assert not scratch.exists(), "root-level scratch files are still cleaned up (control)"
         assert dg.load_tracked() == []
+
+
+class TestConcurrentRegistryWrites:
+    """``post_tool_call`` fires on concurrent tool workers, so tracked.json updates
+    must neither lose entries nor share a temp file between writers."""
+
+    def test_parallel_track_keeps_every_entry(self, _isolate_env):
+        dg = _load_lib()
+        scratch = _isolate_env / "hermes-test"
+        scratch.mkdir()
+        targets = []
+        for i in range(64):
+            f = scratch / f"frag_{i}.txt"
+            f.write_text("x")
+            targets.append(f)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as ex:
+            list(ex.map(lambda f: dg.track(str(f), "test", silent=True), targets))
+
+        entries = dg.load_tracked()
+        assert {e["path"] for e in entries} == {str(f) for f in targets}
+        assert len(entries) == len(targets)
+
+    def test_registry_changes_made_during_quick_scan_survive_its_save(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+        scratch = _isolate_env / "hermes-test"
+        scratch.mkdir()
+        old, kept, late = (scratch / name for name in ("test_old.txt", "kept.txt", "test_late.txt"))
+        for f in (old, kept, late):
+            f.write_text("x")
+        assert dg.track(str(old), "test", silent=True)
+        assert dg.track(str(kept), "other", silent=True)
+
+        real_delete = dg._delete_item
+
+        def delete_while_other_workers_update_the_registry(item):
+            dg.track(str(late), "test", silent=True)
+            dg.forget(str(kept))
+            return real_delete(item)
+
+        monkeypatch.setattr(dg, "_delete_item", delete_while_other_workers_update_the_registry)
+        summary = dg.quick()
+
+        assert summary["deleted"] == 1
+        assert not old.exists()
+        assert [e["path"] for e in dg.load_tracked()] == [str(late)]
+
+    def test_save_interleaved_with_another_save_does_not_lose_its_temp_file(self, _isolate_env, monkeypatch):
+        dg = _load_lib()
+        first = [{"path": "/tmp/hermes-x/first", "category": "test", "size": 1,
+                  "timestamp": datetime.now(timezone.utc).isoformat()}]
+        second = [{"path": "/tmp/hermes-x/second", "category": "test", "size": 2,
+                   "timestamp": datetime.now(timezone.utc).isoformat()}]
+        dg.save_tracked(first)  # tracked.json exists, so the next save takes the backup step
+
+        real_copy2 = shutil.copy2
+        nested = []
+
+        def copy2_then_save_from_another_writer(*args, **kwargs):
+            real_copy2(*args, **kwargs)
+            if not nested:
+                nested.append(True)
+                dg.save_tracked(second)  # a second writer lands between our temp write and rename
+
+        monkeypatch.setattr(dg.shutil, "copy2", copy2_then_save_from_another_writer)
+        dg.save_tracked(first + second)
+
+        assert [e["path"] for e in dg.load_tracked()] == ["/tmp/hermes-x/first", "/tmp/hermes-x/second"]
+        assert not list((_isolate_env / "disk-cleanup").glob("*.tmp"))
 
 
 class TestGitWorktreeFilesNeverCleaned:
