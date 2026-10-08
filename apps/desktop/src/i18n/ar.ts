@@ -37,7 +37,14 @@ export const arOverrides = {
   artifactCard: arArtifacts.artifactCard,
   artifactPreview: arArtifacts.artifactPreview,
   sidebar: arChrome.sidebar,
-  composer: arChat.composer,
+  composer: {
+    ...arChat.composer,
+    redirect: 'إعادة توجيه التشغيل الحالي',
+    queueLostNote: 'فُقد الدور أثناء إعادة التشغيل',
+    restoreImageDraft: 'استعادة مسودة الصورة',
+    queueLostDiscard: 'تجاهل',
+    queueLostDiscardTip: 'أعادت البوابة التشغيل أثناء هذا الدور ولا يمكن إكماله. تجاهله لتستمر الأدوار المنتظرة خلفه.'
+  },
   statusStack: arChat.statusStack,
   updates: arBoot.updates,
   install: arBoot.install,

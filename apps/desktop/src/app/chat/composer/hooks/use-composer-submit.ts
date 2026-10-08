@@ -6,6 +6,7 @@ import { translateNow, useI18n } from '@/i18n'
 import { isSlashCommandText } from '@/lib/chat-runtime'
 import { isSideTaskSlashCommand } from '@/lib/desktop-slash-commands'
 import { triggerHaptic } from '@/lib/haptics'
+import type { BusyInputMode } from '@/store/busy-input-mode'
 import { answerSetupCard, hasClarifyRequest, skipClarifyRequest } from '@/store/clarify'
 import {
   clearSessionDraft,
@@ -14,7 +15,7 @@ import {
   isFreshDraftScope
 } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
-import { enqueueQueuedPrompt, type QueuedPromptEntry } from '@/store/composer-queue'
+import { enqueueQueuedPrompt, type QueuedPromptEntry, serverOwnsComposerQueue } from '@/store/composer-queue'
 import { hasConnectionRequest, skipConnectionRequest } from '@/store/connection-request'
 import { notify } from '@/store/notifications'
 import { hasBlockingPromptRequest } from '@/store/prompts'
@@ -31,6 +32,7 @@ interface UseComposerSubmitArgs {
   activeQueueSessionKeyRef: RefObject<string | null>
   attachments: ComposerAttachment[]
   busy: boolean
+  busyInputMode?: BusyInputMode | null
   clearDraft: () => void
   disabled: boolean
   draftScopeRef: RefObject<string | null>
@@ -45,7 +47,7 @@ interface UseComposerSubmitArgs {
   onSteer: ChatBarProps['onSteer']
   onSteerHidden: ChatBarProps['onSteerHidden']
   onSubmit: ChatBarProps['onSubmit']
-  queueCurrentDraft: () => boolean
+  queueCurrentDraft: () => boolean | Promise<boolean>
   queueEdit: QueueEditState | null
   queuedPrompts: QueuedPromptEntry[]
   sessionId: string | null | undefined
@@ -67,6 +69,7 @@ export function useComposerSubmit({
   activeQueueSessionKeyRef,
   attachments,
   busy,
+  busyInputMode = 'interrupt',
   clearDraft,
   disabled,
   draftScopeRef,
@@ -98,12 +101,20 @@ export function useComposerSubmit({
   // === false) or throws, re-stash the draft so the words survive. Repaint it
   // only while the same session still owns the visible composer; a late reject
   // must not publish an old session's text into the newly focused one.
-  const dispatchSubmit = (text: string, attachments?: ComposerAttachment[], displayKind?: 'hidden') => {
+  // `target` carries an explicit destination (a canonical queue admission).
+  const dispatchSubmit = (
+    text: string,
+    attachments?: ComposerAttachment[],
+    displayKind?: 'hidden',
+    target?: Parameters<ChatBarProps['onSubmit']>[1]
+  ) => {
     // A fresh chat's composer is keyed by its per-lifecycle fresh-draft key
     // (`__new__:<uuid>`), but the submit contract spells "no session yet" as
     // null: the create handoff below and the composer drift prong both key off
     // it, and draftKey(null) resolves to that same fresh bucket.
-    const submittedScope = isFreshDraftScope(draftScopeRef.current) ? null : draftScopeRef.current
+    const submittedScope =
+      target?.storedSessionId ?? (isFreshDraftScope(draftScopeRef.current) ? null : draftScopeRef.current)
+
     let restoreScope = submittedScope
     const submittedAttachments = attachments ?? []
 
@@ -131,14 +142,13 @@ export function useComposerSubmit({
     const rejected = displayKind ? () => {} : restore
 
     void Promise.resolve(
-      attachments
-        ? onSubmit(text, {
-            attachments,
-            composerScope: submittedScope,
-            ...assignment,
-            ...(displayKind ? { displayKind } : {})
-          })
-        : onSubmit(text, { composerScope: submittedScope, ...assignment, ...(displayKind ? { displayKind } : {}) })
+      onSubmit(text, {
+        ...target,
+        ...(attachments ? { attachments } : {}),
+        composerScope: submittedScope,
+        ...assignment,
+        ...(displayKind ? { displayKind } : {})
+      })
     )
       .then(accepted => void (accepted === false ? rejected() : clearSessionDraft(submittedScope)))
       .catch(rejected)
@@ -248,12 +258,17 @@ export function useComposerSubmit({
       clearDraft()
       dispatchSubmit(text)
     } else if (!blockingPrompt && !attachments.length && text.trim()) {
-      // Cursor-style stop-and-correct: interrupt the live turn and redirect
-      // it with this text. redirect() preserves the shown reasoning/work; if
-      // the turn already ended, steerDraft re-queues so nothing is lost.
-      // Compaction is the gateway's call: it answers `queued` under the
-      // compression lock. The client flag can outlive an aborted compaction.
-      steerDraft()
+      // Busy Send follows the backend busy-input policy: interrupt redirects
+      // the live turn (Cursor-style stop-and-correct), steer injects at the
+      // next tool boundary, queue admits it as the next turn. If the turn
+      // already ended, steerDraft re-queues so nothing is lost. Compaction is
+      // the gateway's call: it answers `queued` under the compression lock.
+      // Unloaded policy (null) must not turn an intended queue into an interrupt.
+      if (busyInputMode === 'queue') {
+        queueCurrentDraft()
+      } else if (busyInputMode !== null) {
+        steerDraft(busyInputMode)
+      }
     } else if (payloadPresent) {
       // Attachments can't ride a redirect (no tool-result image carriage) —
       // queue the whole payload for the next turn. Same for a turn parked on
@@ -387,7 +402,7 @@ export function useComposerSubmit({
   // Redirect the live turn with a correction. The gateway either restarts the
   // active model request with its displayed context or waits for the current
   // tool boundary. If the turn already ended, queue the words instead.
-  const steerDraft = () => {
+  const steerDraft = (mode: 'interrupt' | 'steer' = 'interrupt') => {
     const text = draftRef.current.trim()
 
     // Guard on live editor state, not the render-lagged `canSteer`: a redirect
@@ -413,26 +428,40 @@ export function useComposerSubmit({
     triggerHaptic('submit')
     clearDraft()
 
+    const submittedScope = activeQueueSessionKeyRef.current
+
     // The draft is already cleared, so a refused or failed redirect must keep
-    // the only copy: queue it for the next turn, or restore it when there is no
+    // the only copy (#68927): the canonical gateway queue when the server owns
+    // it, the local queue otherwise, or the composer itself when there is no
     // queue yet (a new chat is busy before its first session exists). Keep the
     // frozen transport for the queue; restoring to the composer keeps the chip
     // form so the user can re-send it as-is.
     const hasTerminalTransport = frozen.displayText !== frozen.transportText
+    const canonical = serverOwnsComposerQueue(sessionId ?? activeQueueSessionKey)
 
     const keep = () => {
-      if (activeQueueSessionKey) {
+      if (!activeQueueSessionKey) {
+        loadIntoComposer(frozen.displayText, [])
+        stashAt(submittedScope, frozen.displayText, [])
+      } else if (canonical) {
+        // `fromQueue` skips the submit-side freeze, so hand it the frozen transport.
+        dispatchSubmit(frozen.transportText, [], undefined, {
+          ...(hasTerminalTransport ? { displayText: frozen.displayText } : {}),
+          fromQueue: true,
+          sessionId: sessionId ?? null,
+          storedSessionId: activeQueueSessionKey
+        })
+      } else {
         enqueueQueuedPrompt(activeQueueSessionKey, {
           text: frozen.displayText,
           attachments: [],
           ...(hasTerminalTransport ? { displayText: frozen.displayText, frozenTransport: frozen.transportText } : {})
         })
-      } else {
-        loadIntoComposer(frozen.displayText, [])
       }
     }
 
-    void Promise.resolve(onSteer(frozen.transportText))
+    void Promise.resolve()
+      .then(() => onSteer(frozen.transportText, mode))
       .then(accepted => {
         if (!accepted) {
           keep()

@@ -37,7 +37,7 @@ def session_key_profile(session_key: Any) -> Optional[str]:
     parts = session_key.split(":")
     if len(parts) < 3 or parts[0] != "agent" or not parts[1]:
         return None
-    from gateway.session import profile_from_session_key_namespace
+    from hermes_state_keys import profile_from_session_key_namespace
     return profile_from_session_key_namespace(parts[1])
 
 

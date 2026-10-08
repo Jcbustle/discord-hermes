@@ -124,12 +124,16 @@ class SessionMaintenanceMixin:
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id
                   )
             """, (cutoff,)).fetchall()]
+            from hermes_state_mutation_retirement import retire_prunable
+            ids = retire_prunable(conn, ids)
             for chunk in _id_chunks(ids):
                 conn.execute(f"DELETE FROM sessions WHERE id IN ({_placeholders(chunk)})", chunk)
             if ids:
                 self._delete_unreferenced_system_prompts(conn)
             return ids
         removed_ids = self._execute_write(_do) or []
+        from hermes_state_media import collect_retired_media
+        collect_retired_media(self)
         for sid in removed_ids if sessions_dir else ():
             self._remove_session_files(sessions_dir, sid)
         return len(removed_ids)
@@ -336,6 +340,8 @@ class SessionMaintenanceMixin:
             session_ids = {row["id"] for row in cursor.fetchall()}
             if exclude_active_write_guards:
                 session_ids -= self._guarded_ids(conn, session_ids)
+            from hermes_state_mutation_retirement import retire_prunable
+            session_ids = retire_prunable(conn, sorted(session_ids))
             if not session_ids:
                 return 0
             # Batched: a cron-heavy store prunes tens of thousands of ids in one call.
@@ -348,6 +354,8 @@ class SessionMaintenanceMixin:
             self._delete_unreferenced_system_prompts(conn)
             return len(session_ids)
         count = self._execute_write(_do)
+        from hermes_state_media import collect_retired_media
+        collect_retired_media(self)
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)
         return count

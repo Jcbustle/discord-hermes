@@ -1,0 +1,70 @@
+"""Legacy-handler fallback for authority-backed WebSocket connections.
+
+Session verbs live on the session authority; methods it answers ``-32601`` for may still have a
+legacy sidecar handler (pet, wake word, connectors, config). That fallback must not widen what
+the connection's ticket grants (R2-M3):
+
+* only connections holding the authority's full interactive grant reach legacy dispatch — a
+  worker-adoption ticket (``{'worker:adopt'}``) or a capability-less connection keeps the
+  authority's ``-32601``;
+* a ticket bound to a secondary profile keeps that profile's scope: sessionless
+  ``@_profile_scoped`` handlers read :func:`connection_profile_home` instead of defaulting to the
+  launch profile.
+"""
+
+from __future__ import annotations
+
+import contextvars
+from pathlib import Path
+from typing import Any
+
+_connection_profile_home: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "hermes_ws_connection_profile_home", default=None)
+
+
+# The authority owns every session, its transcript and its admissions: a legacy handler in these
+# namespaces would write the same state.db behind its receipts and revision fence (a legacy
+# ``session.delete`` dropped a row the authority still held live; ``session.branch_stored`` built a
+# second, legacy-owned runtime). Kept: store-wide reads, foreign-history import (new rows only), and
+# Desktop's project move (``session.workspace.move``), which rewrites only the row's cwd/git grouping
+# and has no authority verb yet.
+_SESSION_NAMESPACES = ("session.", "prompt.", "message.")
+_SESSION_FALLBACK_ALLOWED = frozenset({
+    "session.most_recent", "session.active_list", "session.events.stats",
+    "session.foreign.list", "session.foreign.preview", "session.foreign.import",
+    "session.workspace.move",
+})
+
+
+def legacy_fallback_allowed(actor: Any, method: str) -> bool:
+    """True when the connection's grant covers the interactive purpose (the authority's own
+    capability map; never a second list that could drift) and *method* is not a session verb
+    the authority owns."""
+    from gateway.runtime_bootstrap import _PURPOSE_CAPABILITIES
+    if method.startswith(_SESSION_NAMESPACES) and method not in _SESSION_FALLBACK_ALLOWED:
+        return False
+    return _PURPOSE_CAPABILITIES["interactive"] <= frozenset(getattr(actor, "capabilities", ()) or ())
+
+
+def connection_profile_home() -> str | None:
+    """The non-launch profile home the current legacy fallback request's ticket is bound to."""
+    return _connection_profile_home.get()
+
+
+def _foreign_profile_home(server: Any, profile_id: Any) -> str | None:
+    home = Path(str(profile_id or ""))
+    if not home.is_absolute() or not home.is_dir():
+        return None
+    if home.resolve() == Path(server._launch_home()).resolve():
+        return None
+    return str(home)
+
+
+def dispatch_legacy(server: Any, req: dict, transport: Any, actor: Any) -> dict | None:
+    """Run ``server.dispatch`` with the ticket's profile home bound (call from a worker thread;
+    the pool path copies this context, so long handlers see it too)."""
+    token = _connection_profile_home.set(_foreign_profile_home(server, getattr(actor, "profile_id", None)))
+    try:
+        return server.dispatch(req, transport)
+    finally:
+        _connection_profile_home.reset(token)

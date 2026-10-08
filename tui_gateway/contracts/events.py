@@ -184,6 +184,11 @@ class PersistedTurn(Payload):
     complete: bool
     user_row_id: int | None = None
     final_assistant_row_id: int | None = None
+    #: Every rendered user row of the turn in order (prompt, then steer/redirect rows); absent
+    #: unless all of them committed. Binds optimistic bubbles a submit receipt could not name.
+    user_row_ids: list[int] | None = None
+    #: The client submission the turn ran (session authority only; its ack precedes the user row).
+    submission_id: str | None = None
 
 
 class MessageCompletePayload(Payload):

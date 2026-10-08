@@ -311,20 +311,37 @@ def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
 
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
-    delivery_outcome: Optional[str] = None,
+    delivery_outcome: Optional[str] = None, departed_owner: bool = False,
 ) -> Optional[dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    Only the owning process may finish its attempt. ``departed_owner`` is the one exception:
+    receipt recovery (``cron.scheduler_authority.reconcile_pending``) holds the owner's
+    terminal canonical result for an attempt whose firing process provably exited before its
+    own bookkeeping. It settles that attempt with the receipt's verdict instead of leaving it
+    ``running`` for the dead-owner sweep to rewrite as ``unknown``; a live or same-process
+    owner still finishes its own row.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
+        owner = (_PROCESS_ID, os.getpid())
+        if departed_owner:
+            row = conn.execute(
+                """SELECT process_id, pid, process_started_at FROM executions
+                   WHERE id=? AND status IN ('claimed','running')""", (execution_id,)).fetchone()
+            if (row is None or row["process_id"] == _PROCESS_ID
+                    or _owner_is_live(int(row["pid"]), row["process_started_at"])):
+                return None
+            owner = (row["process_id"], row["pid"])
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
                    handoff_started_at=NULL, delivery_outcome=?
                WHERE id=? AND status IN ('claimed','running')
                  AND process_id=? AND pid=?""",
-            (status, now, detail, delivery_outcome, execution_id, _PROCESS_ID, os.getpid()),
+            (status, now, detail, delivery_outcome, execution_id, *owner),
         )
         if cur.rowcount != 1:
             return None
@@ -333,6 +350,68 @@ def finish_execution(
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
     return record
+
+
+def recover_receipted_execution(execution_id, job_id, *, success, error=None, delivery_outcome=None):
+    """Settle a verified canonical receipt after owner loss, including its unknown audit row.
+
+    Terminal verdicts stay immutable. A live firer still owns its bookkeeping
+    (``execution_owner_live``).
+    """
+    now = _hermes_now().isoformat()
+    with _transaction() as conn:
+        row = _recoverable_row(conn, execution_id, job_id)
+        if row is None or _row_owner_live(row):
+            return None
+        conn.execute(
+            """UPDATE executions SET status=?, finished_at=?, error=?, handoff_pending=0,
+               handoff_started_at=NULL, delivery_outcome=? WHERE id=?""",
+            ('completed' if success else 'failed', now, None if success else (str(error) if error else 'unknown failure'),
+             delivery_outcome, execution_id))
+        _prune_unlocked(conn)
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    record_cron_finish(record, delivery_outcome)
+    return record
+
+
+def _recoverable_row(conn, execution_id, job_id):
+    return conn.execute(
+        """SELECT status, process_id, pid, process_started_at FROM executions
+           WHERE id=? AND job_id=? AND status IN ('claimed','running','unknown')""",
+        (str(execution_id), str(job_id))).fetchone()
+
+
+def _row_owner_live(row) -> bool:
+    if row['process_id'] == _PROCESS_ID:
+        # The in-gateway ticker fires on pool threads: a claimed/running row of THIS process is
+        # still in flight here. Only an unknown row was given up by its own firer.
+        return row['status'] != 'unknown'
+    return _owner_is_live(int(row['pid']), row['process_started_at'])
+
+
+def execution_owner_live(execution_id: str, job_id: str) -> bool:
+    """True while the attempt's own firer (this process included) can still finish it, so receipt
+    recovery must not act for it: no output re-save, no job mark, no ledger write."""
+    with _transaction() as conn:
+        row = _recoverable_row(conn, execution_id, job_id)
+    return row is not None and _row_owner_live(row)
+
+
+def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
+    """Replace a terminal attempt's ``queued`` delivery outcome with the drain's real one.
+
+    The only post-terminal rewrite the ledger allows: the attempt's status is untouched and
+    only a ``queued`` handoff can settle, so a replay or a late caller is a no-op.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET delivery_outcome=?
+               WHERE id=? AND delivery_outcome='queued'
+                 AND status IN ('completed','failed','unknown')""",
+            (outcome, execution_id),
+        )
+    return cur.rowcount == 1
 
 
 _OWNER_GONE_REASON = (

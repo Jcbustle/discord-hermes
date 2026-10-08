@@ -334,8 +334,11 @@ def drain(
                 )
             except BaseException as exc:
                 error = f"{type(exc).__name__}: {exc}"
-            _finish(row["execution_id"], error=error,
-                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
+            if _finish(row["execution_id"], error=error,
+                       suppressed=bool(row["job"].get("_notification_all_targets_suppressed"))):
+                from cron.delivery_outcome import settle_quietly
+
+                settle_quietly(row["job"].get("id"), row["execution_id"])
         finally:
             with _lock:
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])

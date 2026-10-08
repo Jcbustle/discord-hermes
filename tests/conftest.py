@@ -250,6 +250,7 @@ from tests._fixtures.live_system_guard import (
     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
     _live_system_guard,
 )
+from tests._fixtures.model_peer import model_peer  # noqa: F401 — fixture registers here
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
 
 

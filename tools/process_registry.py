@@ -37,6 +37,7 @@ from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_termination import ProcessTerminationMixin
 from tools.process_registry_results import load_completed_results, save_completed_result
 from tools.process_registry_env_log import log_delta_command
+from tools.process_registry_wsl import _is_wsl_launcher_command
 
 logger = logging.getLogger(__name__)
 
@@ -661,39 +662,11 @@ _CHECKPOINT_DEFAULTS = {
 }
 
 
-_WSL_LAUNCHER_NAMES = frozenset({"wsl", "wsl.exe"})
-
 _WSL_CHAIN_NOTE = (
     "Spawned via a wsl[.exe] launcher: the recorded host PID is the short-lived "
     "launcher, not the Linux-side workers. Inspect them with `wsl -e ps` / "
     "`wsl --list --running` from the host."
 )
-
-
-def _is_wsl_launcher_command(command: str) -> bool:
-    """True when *command* routes through a ``wsl[.exe]`` launcher chain (#120546).
-
-    The host PID recorded for such a spawn belongs to the short-lived launcher;
-    grandchildren inside the VM outlive it, so the entry must say so instead of
-    letting host-side hunting fail silently.
-    """
-    if not isinstance(command, str) or not command.strip():
-        return False
-    candidates = []
-    try:
-        candidates.append((shlex.split(command, posix=True) or [""])[0])
-    except ValueError:
-        pass
-    # POSIX shlex eats Windows backslashes (``C:\...\wsl.exe``), so also try
-    # the naive first token where path separators survive.
-    words = command.strip().split()
-    if words:
-        candidates.append(words[0])
-    for first in candidates:
-        base = os.path.basename(first.replace("\\", "/")).strip("'\"").lower()
-        if base in _WSL_LAUNCHER_NAMES:
-            return True
-    return False
 
 
 class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
@@ -718,9 +691,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
         # process_loop and the gateway drain it after each agent turn to trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Durable delegation completions are rehydrated by restore_completions(), NOT here: the
-        # module-level singleton runs __init__ on `import model_tools`, and the replay opens
-        # (creates, migrates) the launch profile's state.db (#123265). Importing the module is
+        # Durable delegation completions are NOT rehydrated here: this constructor runs at
+        # import time in every process that touches the tools graph (cron clients, `hermes
+        # sessions list`, workers), and restoring means writing the canonical ledger. The
+        # owner replays them explicitly (GatewayRunner._start_recover_previous_run) and the
+        # first consumer through restore_completions() (#123265). Importing the module is
         # side-effect free and keeps its import-order contract for later completion writers.
         import tools.async_delegation
         # Completions the agent already consumed via wait()/read_log() (output in
@@ -910,6 +885,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin):
     def _watch_event_base(session: ProcessSession) -> dict:
         """Session identity + watcher routing fields shared by every watch event."""
         return {
+            "event_id": uuid.uuid4().hex,
+            "started_at": session.started_at,
+            "parent_session_id": session.parent_session_id,
             "session_id": session.id,
             "session_key": session.session_key,
             "task_id": session.task_id,

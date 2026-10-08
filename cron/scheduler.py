@@ -1372,15 +1372,19 @@ def drain_delivery_queue(adapters, loop) -> int:
     # open/create entirely until a worker has actually queued something.
     if not _path().exists():
         return 0
-    return drain(
-        lambda queued_job, queued_content, queued_for_failure: _deliver_result(
-            queued_job,
-            queued_content,
-            adapters=adapters,
-            loop=loop,
+    def send(queued_job, queued_content, queued_for_failure):
+        error = _deliver_result(
+            queued_job, queued_content, adapters=adapters, loop=loop,
             for_failure=queued_for_failure,
         )
-    )
+        # The ping left the process: book the incident alerted. A notice every target hid
+        # (warning notifications suppressed) is a durable disposition, not an alert.
+        if (not error and queued_for_failure
+                and not queued_job.get("_notification_all_targets_suppressed")):
+            _mark_incident_alerted(queued_job.get("_failure_incident_id"))
+        return error
+
+    return drain(send)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -1859,9 +1863,11 @@ def _init_cron_mcp_tools(job_id: str) -> None:
 
 
 def _open_cron_session_db(job: dict):
-    """Open the SQLite session store under its own timeout (HERMES_CRON_TIMEOUT only watches
-    run_conversation). A wedged sqlite3.connect returns None (no session store) instead of
-    wedging the worker thread."""
+    """Bound store acquisition separately from the conversation watchdog.
+
+    Canonical runs borrow the owner's exact store and fail closed on acquisition
+    errors. Only the legacy non-owner helper path may return no session store.
+    """
     # Initialize the SQLite session store so cron job messages are persisted and discoverable via
     # session_search (same pattern as gateway/run.py) — only now, after every early-return path (wake-gate,
     # prompt validation, drift skip) has passed, so a gated run never opens state.db just to abandon the
@@ -1870,17 +1876,34 @@ def _open_cron_session_db(job: dict):
     # no timeout of its own against a wedged sqlite3.connect (e.g. a stale flock left by a crashed sibling
     # process). An unbounded hang here would wedge the job's worker thread, so the init is bounded and a
     # timeout proceeds without a session store instead of blocking the run forever.
+    from gateway.session_cron import current_execution
+    owner = current_execution()
+    from agent.runtime_session_store import WorkerPersistenceError, is_worker_process
+    if owner is None and is_worker_process():
+        # Do not turn an unsupported worker assignment into the legacy None
+        # fallback: that would run billed inference without durable persistence.
+        raise WorkerPersistenceError('worker_cron_registration_required')
     _session_db_timeout = _get_session_db_timeout()
     try:
         from hermes_state_registry import acquire
 
+        def acquire_store():
+            if owner is None:
+                return acquire()
+            db = acquire(Path(owner[0].db.db_path))
+            if db is not owner[0].db:
+                from hermes_state_registry import release_or_close
+                release_or_close(db)
+                raise RuntimeError('cron requires the canonical owner store')
+            return db
+
         if _session_db_timeout <= 0:
-            return acquire()
+            return acquire_store()
         _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Copy the context so a profile run resolves ITS OWN home/state.db on the worker thread
         # instead of the process-global default.
         _session_db_context = contextvars.copy_context()
-        _session_db_future = _session_db_pool.submit(_session_db_context.run, acquire)
+        _session_db_future = _session_db_pool.submit(_session_db_context.run, acquire_store)
         try:
             return _session_db_future.result(timeout=_session_db_timeout)
         except concurrent.futures.TimeoutError:
@@ -1896,11 +1919,15 @@ def _open_cron_session_db(job: dict):
             # Abandon a wedged connect() rather than blocking shutdown on it.
             _session_db_pool.shutdown(wait=False)
     except concurrent.futures.TimeoutError:
+        if owner is not None:
+            raise TimeoutError("Canonical cron session store acquisition timed out")
         logger.error(
             "Job '%s': SessionDB init did not return within %.0fs — proceeding "
             "without a session store for this run instead of blocking it forever",
             job.get("id", "?"), _session_db_timeout)
     except Exception as e:
+        if owner is not None:
+            raise
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
     return None
 
@@ -2542,6 +2569,14 @@ def run_job(
     ``extra_prompt``: optional per-run context from ``cronjob(action='run', prompt=...)`` (#57331). Appended
     to the stored prompt for this fire only — never persisted to the job definition.
     """
+    from gateway.session_cron import current_execution
+    owner_execution = current_execution()
+    if owner_execution is not None and owner_execution[2:] != (job['id'], execution_id):
+        owner_execution = None
+    if not job.get("no_agent") and owner_execution is None:
+        from cron.scheduler_authority import run_canonical_job
+        return run_canonical_job(job, extra_prompt=extra_prompt, cancel_event=cancel_event,
+                                 execution_id=execution_id)
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
@@ -2550,7 +2585,8 @@ def run_job(
         return early
     from run_agent import AIAgent
 
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = (owner_execution[1] if owner_execution is not None else
+                        f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}")
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
@@ -3105,6 +3141,19 @@ def _save_compose_deliver(
 
     if not d.should_deliver:
         return
+    execution_id = job.get('execution_id')
+    if execution_id and not job.get('no_agent'):
+        from cron.delivery_queue import enqueue
+        if _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)) == "local":
+            return
+        queued_job = dict(job)
+        if d.failure_incident_id:
+            queued_job["_failure_incident_id"] = d.failure_incident_id
+        queued = enqueue(execution_id, queued_job, deliver_content, for_failure=not d.success)
+        # The queue owns this send even if subsequent bookkeeping fails.
+        d.delivery_attempted = True
+        job['last_delivery_queued'] = {'canonical': {'status': queued['status'], 'execution_id': execution_id}}
+        return
     d.unresolved_origin = (
         _normalize_deliver_value(_delivery_lane_value(job, for_failure=not d.success)) == "origin"
         and not _resolve_delivery_targets(job, for_failure=not d.success)
@@ -3130,27 +3179,7 @@ def _save_compose_deliver(
         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
 
-def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Optional[str]) -> None:
-    """Shutdown already wrote last_status, so mark_job_run is skipped (a second call would skip a
-    fire or auto-delete the job); an unsent notice is recorded via update_job instead."""
-    if delivery_error:
-        try:
-            # The gateway shutdown already wrote last_status for this run, so mark_job_run is skipped below
-            # — but it could not know that the notice we just tried to send never left the process (the
-            # adapters were torn down first, #82232). Record the delivery failure on its own via update_job:
-            # mark_job_run also advances next_run_at and the repeat counter, and running that a second time
-            # for one run would skip a fire or auto-delete the job early.
-            from cron.jobs import update_job
-            update_job(job["id"], {"last_delivery_error": delivery_error})
-        except Exception as _rec_err:
-            logger.debug(
-                "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
-    finish_execution(
-        execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
-
-
-def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
+def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str, *, recovered=False) -> bool:
     """mark_job_run (owner-fenced) + execution ledger row for a run that reached delivery."""
     job = d.job
     if not d.should_deliver and job.get("last_delivery_queued"):
@@ -3158,6 +3187,10 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
+    from cron.scheduler_authority import journal_path
+    journal = journal_path(job['id'], execution_id)
+    if not job.get('no_agent'):
+        mark_kwargs['execution_id'] = execution_id
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
         # (cron/unreachable_retry.py) inside the same fenced store write.
@@ -3196,11 +3229,28 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         incident_acked=d.incident_acked,
         success=d.success,
     )
+    from cron.delivery_outcome import settle_quietly, settled_outcome
+    if delivery_outcome == "queued":
+        # A drain that already finished this send (cron/delivery_outcome.py) is the real outcome.
+        delivery_outcome = settled_outcome(execution_id) or "queued"
     if delivery_outcome in ("delivered", "not_configured") and not d.success:
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
-    finish_execution(
+    from functools import partial
+    from cron.executions import get_execution, recover_receipted_execution
+    finish = partial(recover_receipted_execution, job_id=job['id']) if recovered else finish_execution
+    finished = finish(
         execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+    if recovered and finished is None:
+        current = get_execution(execution_id)
+        # A live foreign firer still owns this row. Keep its only recovery link until settlement.
+        # Legacy direct calls may have no execution row; an already-finished row is also safe.
+        if current is not None and current['status'] not in {'completed', 'failed'}:
+            return False
+    if job.get("last_delivery_queued"):
+        # A drain that settled before this run's own bookkeeping landed found nothing to fence on.
+        settle_quietly(job["id"], execution_id)
+    journal.unlink(missing_ok=True)
     return True
 
 
@@ -3301,6 +3351,19 @@ def _start_owned_run(job: dict, execution_id: str) -> "Optional[contextvars.Toke
     return enter_cron_execution(job, execution_id, record or {})
 
 
+def _apply_agent_failure_marker(job: dict, success: bool, error, final_response):
+    """An agent can finish its own turn after a delegated child has failed. Let it explicitly
+    declare that semantic failure so the existing failure path updates status, streaks, ledger,
+    and notification routing instead of recording a false healthy result.
+
+    Returns ``(success, error, agent_declared)``."""
+    if success and not job.get("no_agent"):
+        marker_error = _cron_failure_marker_error(final_response)
+        if marker_error is not None:
+            return False, marker_error, True
+    return success, error, False
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
@@ -3316,6 +3379,7 @@ def _run_one_job_body(
     if not execution_id:
         execution_id = create_execution(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+    job = dict(job, execution_id=execution_id)
     delivery_attempted = False
     delivery_error = None
 
@@ -3391,14 +3455,7 @@ def _run_one_job_body(
             _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
 
-        # An agent can finish its own turn after a delegated child has failed. Let it explicitly
-        # declare that semantic failure so the existing failure path updates status, streaks,
-        # ledger, and notification routing instead of recording a false healthy result.
-        agent_declared = False
-        if success and not job.get("no_agent"):
-            marker_error = _cron_failure_marker_error(final_response)
-            if marker_error is not None:
-                success, error, agent_declared = False, marker_error, True
+        success, error, agent_declared = _apply_agent_failure_marker(job, success, error, final_response)
 
         # Agent is still live through delivery; wrap ALL of save/compose/deliver in try/finally so a
         # raise anywhere still tears the deferred agent down.
@@ -3445,12 +3502,19 @@ def _run_one_job_body(
                 return True
 
         if _consume_interrupted_flag(job["id"], execution_token):
-            _finish_interrupted_run(job, execution_id, delivery_error)
+            from cron.scheduler_bookkeeping import finish_interrupted_run
+            finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
         return _finish_completed_run(d, fire_owner, execution_id)
 
     except BaseException as e:
+        from cron.scheduler_authority import CronExecutionUnknown
+        if isinstance(e, CronExecutionUnknown):
+            from cron.jobs import pause_job
+            pause_job(job["id"], reason=str(e))
+            logger.error("Cron %s paused with unverified admission: %s", job["id"], e)
+            return False
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
         # Without mark_job_run(False) a finite one-shot is wedged: claim_dispatch consumed
         # repeat.completed but last_run_at is never written. Record first, then re-raise
@@ -4434,4 +4498,4 @@ if __name__ == "__main__":
         raise SystemExit(
             0 if _run_external_worker_payload(args.external_worker_file, args.ack_file) else 1
         )
-    tick(verbose=True)
+    tick(verbose=True, headless=True)

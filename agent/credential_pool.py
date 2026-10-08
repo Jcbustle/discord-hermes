@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
+from agent.credential_pool_timestamps import _parse_absolute_timestamp
 
 import logging
 import os
@@ -400,31 +401,6 @@ def _exhausted_ttl(
     return base
 
 
-def _parse_absolute_timestamp(value: Any) -> Optional[float]:
-    """Best-effort parse of epoch seconds / epoch ms / ISO-8601 into epoch seconds."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, (int, float)):
-        numeric = float(value)
-        if numeric <= 0:
-            return None
-        return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        try:
-            numeric = float(raw)
-            return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
-        except ValueError:
-            pass
-        try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
-    return None
-
-
 def _singleton_predates_entry(state: Any, entry: "PooledCredential") -> bool:
     """True only when the auth.json singleton is PROVABLY older than *entry*.
 
@@ -559,6 +535,11 @@ def custom_provider_pool_key_candidates(
     if requested_aliases:
         for norm_name, entry in _iter_custom_providers():
             if requested_aliases & _custom_entry_name_aliases(norm_name, entry):
+                # A named pool holds credentials for its configured endpoint only: a launch-
+                # overridden base_url must not inherit them (R2-M1), nor borrow a sibling's by URL.
+                entry_url = _norm_url(entry.get("base_url"))
+                if entry_url and entry_url != normalized_url:
+                    return []
                 return _pool_keys_for_custom_entry(norm_name, entry)
 
     for norm_name, entry in _iter_custom_providers():

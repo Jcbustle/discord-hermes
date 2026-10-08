@@ -8,6 +8,7 @@
  * fixed sleep.
  */
 
+import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as net from 'node:net'
 import * as os from 'node:os'
@@ -70,11 +71,78 @@ export function createCoreSandbox(label: string): CoreSandbox {
     hermesHome,
     userDataDir,
     cleanup: () => {
+      // Attach-mode Desktop never stops the gateway it dialled, so without this
+      // every spec left its sandbox `gateway run` behind (~20 per suite run).
+      stopSandboxGatewayDaemons(root, hermesHome)
+
       if (!process.env.HERMES_E2E_CORE_KEEP) {
         fs.rmSync(root, { recursive: true, force: true })
       }
     }
   }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+function processHomeUnder(pid: number, root: string): boolean {
+  const info = readProc(pid)
+
+  return Boolean(info?.cmdline) && info!.environ.split('\0').some(entry => entry.startsWith(`HERMES_HOME=${root}`))
+}
+
+/**
+ * SIGTERM (then SIGKILL after 15 s) every daemon recorded in a sandbox
+ * `gateway.lock` (launch home and each profile home). The pid is only
+ * signalled while its environment still names this sandbox, so a recycled pid
+ * is never touched.
+ */
+function stopSandboxGatewayDaemons(root: string, hermesHome: string): void {
+  const profilesDir = path.join(hermesHome, 'profiles')
+
+  const homes = [
+    hermesHome,
+    ...(fs.existsSync(profilesDir) ? fs.readdirSync(profilesDir).map(name => path.join(profilesDir, name)) : [])
+  ]
+
+  const pids = new Set<number>()
+
+  for (const home of homes) {
+    try {
+      const pid = Number(JSON.parse(fs.readFileSync(path.join(home, 'gateway.lock'), 'utf8'))?.pid)
+
+      if (Number.isInteger(pid) && pid > 0 && processHomeUnder(pid, root)) {
+        pids.add(pid)
+      }
+    } catch {
+      // No lock (remote-only spec, never booted) or an empty one: nothing to stop.
+    }
+  }
+
+  const signal = (sig: NodeJS.Signals) => {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, sig)
+      } catch {
+        pids.delete(pid)
+      }
+    }
+  }
+
+  signal('SIGTERM')
+
+  for (const deadline = Date.now() + 15_000; pids.size && Date.now() < deadline; ) {
+    sleepSync(100)
+
+    for (const pid of [...pids]) {
+      if (!processHomeUnder(pid, root)) {
+        pids.delete(pid)
+      }
+    }
+  }
+
+  signal('SIGKILL')
 }
 
 /**
@@ -254,13 +322,36 @@ export function sandboxProcesses(sandbox: CoreSandbox): ProcInfo[] {
  * dead backend is reparented away and still counted.
  */
 export function backendProcesses(sandbox: CoreSandbox): ProcInfo[] {
+  // The local backend is the gateway `hermes gateway ensure` attached to or started
+  // (`hermes_cli.main [--profile X] gateway run --quiet`); `serve` covers a pool backend.
   const serve = sandboxProcesses(sandbox).filter(
-    proc => / serve( |$)/.test(proc.cmdline) && !/electron/i.test(proc.cmdline.split(' ')[0])
+    proc => (/ serve( |$)/.test(proc.cmdline) || / gateway run( |$)/.test(proc.cmdline))
+      && !/electron/i.test(proc.cmdline.split(' ')[0])
   )
 
   const pids = new Set(serve.map(proc => proc.pid))
 
   return serve.filter(proc => !pids.has(proc.ppid))
+}
+
+
+/**
+ * `hermes gateway stop` for the sandbox profile, run with the backend's own
+ * interpreter (argv[0] of the live `gateway run`). Attach-mode Desktop never
+ * owns the gateway, so this is how a test proves teardown works when asked.
+ */
+export function stopSandboxGateway(sandbox: CoreSandbox): { code: number | null; output: string } {
+  const [backend] = backendProcesses(sandbox)
+  const python = backend?.cmdline.split(' ')[0] || 'python3'
+
+  const result = spawnSync(python, ['-m', 'hermes_cli.main', 'gateway', 'stop'], {
+    cwd: REPO_ROOT,
+    env: coreAppEnv(sandbox),
+    encoding: 'utf8',
+    timeout: 90_000
+  })
+
+  return { code: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` }
 }
 
 // ─── WebSocket recorder ─────────────────────────────────────────────────

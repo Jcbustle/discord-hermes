@@ -1506,12 +1506,6 @@ export const deOverrides = {
         }
       }
     },
-    poolLimits: {
-      warmBotBackendsAria: 'Bot-Backends vorwärmen',
-      warmBotBackendsTitle: 'Bot-Backends vorwärmen',
-      backendIdleTimeoutAria: 'Leerlauf-Timeout des Backends in Millisekunden',
-      backendIdleTimeoutTitle: 'Leerlauf-Timeout des Backends'
-    },
     customEndpoints: {
       active: 'Aktiv',
       apiKeySet: 'API-Schlüssel gesetzt',
@@ -3860,6 +3854,7 @@ export const deOverrides = {
     openDirective: 'Öffnen',
     queueMessage: 'Nachricht einreihen',
     steer: 'Laufenden Lauf steuern',
+    redirect: 'Laufenden Lauf umleiten',
     stop: 'Stopp',
     send: 'Senden',
     speaking: 'Spricht',
@@ -4013,6 +4008,11 @@ export const deOverrides = {
     queueDelete: 'Löschen',
     queueResume: 'Fortsetzen',
     queueResumeTip: 'Durch Stopp pausiert — fortsetzen, um die eingereihten Turns zu senden',
+    queueLostNote: 'Turn beim Neustart verloren',
+    restoreImageDraft: 'Bildentwurf wiederherstellen',
+    queueLostDiscard: 'Verwerfen',
+    queueLostDiscardTip:
+      'Das Gateway wurde mitten im Turn neu gestartet und kann ihn nicht abschließen. Verwirf ihn, damit die eingereihten Turns dahinter laufen.',
     queueStuckTitle: 'Eingereihte Nachricht nicht gesendet',
     queueStuckBody:
       'Ein eingereihter Turn konnte nicht gesendet werden. Er ist noch in der Warteschlange — versuchen Sie, ihn erneut zu senden.',

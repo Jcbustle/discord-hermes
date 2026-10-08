@@ -57,3 +57,69 @@ async def test_streamed_completion_approval_resolves_via_runs_endpoint(monkeypat
     assert decisions and decisions[0]["choice"] == "once"
     assert event["run_id"] not in adapter._run_approval_sessions
     assert adapter._run_statuses[event["run_id"]]["status"] == "completed"
+
+
+def _canonical_approval_turn(owner, decisions):
+    """A controlled canonical turn: the real blocking gateway wait, published through the
+    authority's shared controls exactly as ``TurnRunner._approval_notify_sync`` does."""
+    async def handle(event):
+        from gateway.session_results import execution_result
+        from tools.approval_gateway_wait import _await_gateway_decision
+        sid = event.source.chat_id
+        live, generation = owner.sessions[sid], owner.db.get_session(sid)['runtime_generation']
+
+        def notify(data):
+            owner.register_approval(sid, generation, live.route, data)
+        decisions.append(await asyncio.to_thread(_await_gateway_decision, live.route, notify, {
+            "command": "rm -rf /tmp/x", "description": "dangerous", "pattern_key": "rm"}))
+        execution_result.get()['result'] = {'final_response': 'ok', 'messages': []}
+        return 'ok'
+    return handle
+
+
+async def _sse_event(resp, name):
+    pending = None
+    async for raw in resp.content:
+        line = raw.decode().strip()
+        if line == f"event: {name}":
+            pending = True
+        elif pending and line.startswith("data: "):
+            return json.loads(line[6:])
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["chat_completions", "session_stream"])
+async def test_canonical_streamed_approval_reaches_sse_and_resolves_via_runs_endpoint(api, owner, monkeypatch, surface):
+    """Under the session authority the advertised stream run id is bound to its exact durable
+    admission: the shared approval prompt reaches the SSE, and the generation-fenced reply to
+    ``POST /v1/runs/{run_id}/approval`` resolves the same waiter WS viewers see."""
+    monkeypatch.setattr("tools.approval_context._get_approval_timeout", lambda: 5)
+    decisions = []
+    owner.runner._handle_message = _canonical_approval_turn(owner, decisions)
+    app = _create_app(api)
+    app.router.add_post("/v1/runs/{run_id}/approval", api._handle_run_approval)
+    async with TestClient(TestServer(app)) as cli:
+        if surface == "chat_completions":
+            resp = await cli.post("/v1/chat/completions", json={
+                "model": "hermes-agent", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            prefix = "chatcmpl"
+        else:
+            owner.db.create_session("api-stream", source="api_server")
+            resp = await cli.post("/api/sessions/api-stream/chat/stream", json={"message": "hi"})
+            prefix = "run_"
+        assert resp.status == 200, await resp.text()
+        event = await asyncio.wait_for(_sse_event(resp, "approval.request"), 10)
+        assert event and event["run_id"].startswith(prefix) and event["command"], event
+        assert set(event["choices"]) == {"once", "session", "always", "deny"}
+        stale = await cli.post(f"/v1/runs/{event['run_id']}/approval", json={
+            "request_id": event["request_id"], "execution_generation": event["execution_generation"] + 1,
+            "choice": "once"})
+        assert stale.status == 409 and (await stale.json())["error"]["code"] == "stale_generation"
+        approval = await cli.post(f"/v1/runs/{event['run_id']}/approval", json={
+            "request_id": event["request_id"], "execution_generation": event["execution_generation"],
+            "choice": "once"})
+        assert approval.status == 200, await approval.text()
+        assert (await approval.json())["status"] == "resolved"
+        await asyncio.wait_for(resp.text(), 10)
+    assert decisions and decisions[0]["choice"] == "once"

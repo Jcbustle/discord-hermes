@@ -1512,12 +1512,6 @@ export const frOverrides = {
         }
       }
     },
-    poolLimits: {
-      warmBotBackendsAria: 'Backends de bots maintenus actifs',
-      warmBotBackendsTitle: 'Backends de bots actifs',
-      backendIdleTimeoutAria: "Délai d'inactivité du backend en millisecondes",
-      backendIdleTimeoutTitle: "Délai d'inactivité du backend"
-    },
     customEndpoints: {
       active: 'Actif',
       apiKeySet: 'Clé API définie',
@@ -3868,6 +3862,7 @@ export const frOverrides = {
     openDirective: 'Ouvrir',
     queueMessage: "Mettre le message en file d'attente",
     steer: "Diriger l'exécution en cours",
+    redirect: "Rediriger l'exécution en cours",
     stop: 'Arrêter',
     send: 'Envoyer',
     speaking: 'Parle',
@@ -4024,6 +4019,11 @@ export const frOverrides = {
     queueDelete: 'Supprimer',
     queueResume: 'Reprendre',
     queueResumeTip: "Mis en pause par Arrêter — reprendre l'envoi des tours en file d'attente",
+    queueLostNote: 'Tour perdu pendant le redémarrage',
+    restoreImageDraft: "Restaurer le brouillon d'image",
+    queueLostDiscard: 'Ignorer',
+    queueLostDiscardTip:
+      "La passerelle a redémarré en plein tour et ne peut pas le terminer. Ignorez-le pour que les tours en file d'attente derrière lui s'exécutent.",
     queueStuckTitle: "Message en file d'attente non envoyé",
     queueStuckBody:
       "Un tour en file d'attente a continué à échouer lors de l'envoi. Il est toujours en file d'attente — essayez de l'envoyer à nouveau.",

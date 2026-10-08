@@ -28,10 +28,13 @@ _BRACKETED_SILENCE_MARKERS = tuple(
     sorted(m for m in LIVE_GATEWAY_SILENT_MARKERS if m.startswith("["))
 )
 
-# The persisted user-row kind of a self-injected MessageEvent(internal=True) turn — the only
-# machinery kind the gateway produces; only these may vanish on a bare silence marker.
+# The persisted user-row kind of a self-injected MessageEvent(internal=True) turn; only these
+# machinery kinds may vanish on a bare silence marker.
 INTERNAL_NOTIFICATION_DISPLAY_KIND = "internal_notification"
-MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND})
+# Async-result cards a gateway producer may name on its own internal event (with a display_text),
+# the same rows the in-process TUI persisted. A closed set: never a client-chosen presentation.
+PRODUCER_NOTICE_DISPLAY_KINDS = frozenset({"process_complete"})
+MACHINERY_DISPLAY_KINDS = frozenset({INTERNAL_NOTIFICATION_DISPLAY_KIND, *PRODUCER_NOTICE_DISPLAY_KINDS})
 
 # Longer than any marker could plausibly be, even with stray punctuation.
 _MARKER_LENGTH_CAP = 64
@@ -108,9 +111,21 @@ def display_kind_for_event(event: Any) -> str | None:
     by the gateway poller, never inferred from inbound text), but it deliberately stays
     non-internal so authorization and the emergency stop still apply to it.
     """
+    if getattr(event, "internal", False) and display_metadata_for_event(event):
+        return event.metadata["display_kind"]
     if getattr(event, "internal", False) or getattr(event, "_heartbeat_session_id", None):
         return INTERNAL_NOTIFICATION_DISPLAY_KIND
     return None
+
+
+def display_metadata_for_event(event: Any) -> dict:
+    """``{"display_text": ...}`` for an internal event whose producer named an async-result card."""
+    metadata = getattr(event, "metadata", None) or {}
+    text = metadata.get("display_text")
+    if (getattr(event, "internal", False) and metadata.get("display_kind") in PRODUCER_NOTICE_DISPLAY_KINDS
+            and isinstance(text, str) and text.strip()):
+        return {"display_text": text}
+    return {}
 
 
 def is_machinery_display_kind(display_kind: Any) -> bool:

@@ -253,8 +253,23 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
     return line
   }
 
+  // The canonical authority intentionally returns a narrow metadata snapshot.
+  // Do not invent tool/skill inventories or crash while rendering that session.
+  if (!info.skills || !info.tools) {
+    return (
+      <Box flexDirection="column">
+        <Text>
+          <Text color={t.color.sessionLabel}>Session: </Text>
+          <Text color={t.color.sessionBorder}>{sid}</Text>
+        </Text>
+        <Text color={t.color.muted}>Tool and skill inventory is not exposed by this runtime.</Text>
+      </Box>
+    )
+  }
+
   // ── Collapsible skills section ──
-  const skills = info.skills ?? {}
+  // Non-null here: the narrow-snapshot guard above returned when either is missing.
+  const skills = info.skills
   const skillEntries = Object.entries(skills).sort()
   const skillsTotal = flat(skills).length
   const skillsCatCount = skillEntries.length
@@ -281,7 +296,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   }
 
   // ── Collapsible tools section ──
-  const tools = info.tools ?? {}
+  const tools = info.tools
   const toolEntries = Object.entries(tools).sort()
   const toolsTotal = flat(tools).length
 
