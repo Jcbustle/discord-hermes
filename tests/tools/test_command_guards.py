@@ -78,7 +78,7 @@ class TestCliPrompt:
     def test_dangerous_command_deny(self):
         os.environ["HERMES_INTERACTIVE"] = "1"
         cb = MagicMock(return_value="deny")
-        result = check_all_command_guards("rm -rf /tmp", "local", approval_callback=cb)
+        result = check_all_command_guards("rm -rf ~/scratch-area/root", "local", approval_callback=cb)
         assert result["approved"] is False
         cb.assert_called_once()
         assert cb.call_args[1]["allow_permanent"] is True
@@ -89,8 +89,8 @@ class TestCliPrompt:
         session_key = "guard-session"
         token = set_current_session_key(session_key)
         try:
-            assert check_all_command_guards("rm -rf /tmp/a", "local", approval_callback=cb)["approved"]
-            assert check_all_command_guards("rm -rf /tmp/b", "local", approval_callback=cb)["approved"]
+            assert check_all_command_guards("rm -rf ~/work-area/a", "local", approval_callback=cb)["approved"]
+            assert check_all_command_guards("rm -rf ~/work-area/b", "local", approval_callback=cb)["approved"]
         finally:
             reset_current_session_key(token)
         cb.assert_called_once()
@@ -100,15 +100,15 @@ class TestCliPrompt:
         session_key = "guard-preapproved"
         token = set_current_session_key(session_key)
         try:
-            approve_session(session_key, detect_dangerous_command("rm -rf /tmp/x")[1])
+            approve_session(session_key, detect_dangerous_command("rm -rf ~/work-area/x")[1])
             cb = MagicMock()
-            assert check_all_command_guards("rm -rf /tmp/x", "local", approval_callback=cb)["approved"]
+            assert check_all_command_guards("rm -rf ~/work-area/x", "local", approval_callback=cb)["approved"]
         finally:
             reset_current_session_key(token)
         cb.assert_not_called()
 
     def test_non_interactive_auto_allows(self):
-        result = check_all_command_guards("rm -rf /tmp/x", "local")
+        result = check_all_command_guards("rm -rf ~/work-area/x", "local")
         assert result["approved"] is True
 
 
