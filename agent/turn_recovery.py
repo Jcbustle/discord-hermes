@@ -890,7 +890,7 @@ def _print_nonretryable_auth_guidance(
 
     if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(
         agent, capability="model access", provider=provider, base_url=str(base_url),
-        model=model, unverified=classified.billing_unverified,
+        model=model, unverified=classified.billing_unverified, oauth=agent._is_anthropic_oauth,
     ):
         return
     if provider == "nous" and _print_nous_entitlement_guidance(agent, "Nous model access"):
@@ -1124,6 +1124,7 @@ def nonretryable_client_error_result(
         return _billing_failure_result(
             classified=classified, summary=_nonretryable_summary, messages=messages,
             api_call_count=api_call_count, provider=provider, base_url=base_url, model=model,
+            oauth=agent._is_anthropic_oauth,
         )
     if _welcome_hint:
         # A free-tier refusal is fully explained by its own sentence; the raw provider summary
@@ -1193,7 +1194,7 @@ def max_retries_exhausted_result(
             agent._emit_diagnostic_status(f"❌ Billing or credits exhausted — {_final_summary}")
         _billing_kw = dict(
             capability="model access", provider=provider, base_url=str(base_url), model=model,
-            unverified=classified.billing_unverified,
+            unverified=classified.billing_unverified, oauth=agent._is_anthropic_oauth,
         )
         _billing_guidance = _billing_or_entitlement_message(**_billing_kw)
         _print_billing_or_entitlement_guidance(agent, **_billing_kw)
@@ -1249,7 +1250,8 @@ def max_retries_exhausted_result(
             _final_response += f"\n\n{_billing_guidance}"
         # Structured recovery descriptor so every surface renders the same link + label.
         _billing_block = _billing_block_dict(
-            provider, base_url, model, _billing_guidance, unverified=_billing_unverified
+            provider, base_url, model, _billing_guidance, unverified=_billing_unverified,
+            oauth=agent._is_anthropic_oauth,
         )
     else:
         # Every surface reads final_response (the 💡 lines above are CLI-only), so the chat
