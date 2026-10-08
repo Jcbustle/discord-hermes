@@ -201,6 +201,16 @@ class GatewayACPAgent(acp.Agent):
             return
         await self._cancel_admission(session_id, admission_id)
 
+    async def cancel(self, session_id, **kwargs):
+        if session_id not in self._snapshots:
+            raise GatewayClientError("not_found")
+        admission_id = self._admissions.get(session_id)
+        if admission_id is None:
+            if session_id in self._submitting:
+                self._pending_cancels.add(session_id)
+            return
+        await self._cancel_admission(session_id, admission_id)
+
     async def fork_session(self, cwd, session_id, mcp_servers=None, **kwargs):
         from acp.schema import ForkSessionResponse
         client = await self._client()
@@ -276,6 +286,9 @@ class GatewayACPAgent(acp.Agent):
             self._submitting.discard(session_id)
         admission_id = receipt["admission_id"]
         self._admissions[session_id] = admission_id
+        if session_id in self._pending_cancels:
+            self._pending_cancels.discard(session_id)
+            await self._cancel_admission(session_id, admission_id)
         try:
             if session_id in self._pending_cancels:
                 self._pending_cancels.discard(session_id)

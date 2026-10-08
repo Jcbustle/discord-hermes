@@ -1,5 +1,6 @@
 """Toolset helpers: get/resolve/validate named tool groups (static TOOLSETS + registry-registered)."""
 
+from pathlib import Path
 from typing import Dict, List, Any, Set, Optional, Tuple
 
 
@@ -460,6 +461,17 @@ def session_platform_tool_drops(platform: Optional[str]) -> frozenset:
     """Tools of every platform-gated toolset that a session on *platform* does not get."""
     return frozenset(tool for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms
                      for tool in resolve_toolset(name))
+
+
+def profile_role_toolsets(profile_home: Optional[Path] = None) -> Tuple[Set[str], Set[str]]:
+    """Return role-reserved toolsets granted to this profile and reserved toolsets denied to it."""
+    from hermes_constants import get_hermes_home
+    from profiles.metadata import read_profile_meta
+
+    role = read_profile_meta(Path(profile_home or get_hermes_home())).get("role")
+    granted = {name for name, spec in TOOLSETS.items() if role is not None and spec.get("role") == role}
+    denied = {name for name, spec in TOOLSETS.items() if spec.get("role") not in (None, role)}
+    return granted, denied
 
 
 def session_disabled_toolsets(disabled: Optional[List[str]], platform: Optional[str]) -> Optional[List[str]]:
