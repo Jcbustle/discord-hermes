@@ -1,6 +1,10 @@
+import errno
 import logging
 import os
 import re
+import secrets
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 import subprocess
 import tempfile
@@ -21,7 +25,7 @@ def _mock_subprocess_run(monkeypatch):
     captured call list — these tests inspect the real sandbox-start ``run``.
     Tests that exercise the probe itself live in test_docker_cgroup_limits.py.
     """
-    docker_env._cgroup_limits_ok = True
+    monkeypatch.setattr(docker_env, "_cgroup_limits_ok", True)
     calls = []
 
     def _run(cmd, **kwargs):
@@ -254,6 +258,7 @@ def test_runtime_exec_tracks_scope_and_clears_missing_value(monkeypatch):
     assert "unset SERVICE_TOKEN" in second_cmd[-1]
 
 
+@pytest.mark.platforms("posix")
 def test_wrapped_exec_scopes_explicit_forward_env_across_profiles(monkeypatch, tmp_path):
     """The shared snapshot must not resurrect an explicit forward-only value."""
     from agent import secret_scope as ss
@@ -561,38 +566,7 @@ def test_label_sanitizer_rejects_invalid_characters():
     assert len(docker_env._sanitize_label_value(long_value)) == 63
 
 
-def test_reuse_environment_fingerprint_tracks_immutable_configuration():
-    """Containers with different images, mounts, or Hermes homes must not
-    share the label used for cross-process reuse."""
-    base = docker_env._reuse_environment_fingerprint(
-        image="python:3.11",
-        mount_args=["-v", "volume-a:/workspace"],
-        hermes_home="/profiles/alpha",
-    )
-
-    assert base == docker_env._reuse_environment_fingerprint(
-        image="python:3.11",
-        mount_args=["-v", "volume-a:/workspace"],
-        hermes_home="/profiles/alpha",
-    )
-    assert base != docker_env._reuse_environment_fingerprint(
-        image="python:3.12",
-        mount_args=["-v", "volume-a:/workspace"],
-        hermes_home="/profiles/alpha",
-    )
-    assert base != docker_env._reuse_environment_fingerprint(
-        image="python:3.11",
-        mount_args=["-v", "volume-b:/workspace"],
-        hermes_home="/profiles/alpha",
-    )
-    assert base != docker_env._reuse_environment_fingerprint(
-        image="python:3.11",
-        mount_args=["-v", "volume-a:/workspace"],
-        hermes_home="/profiles/beta",
-    )
-
-
-def test_reuse_environment_fingerprint_ignores_volatile_temp_mounts(tmp_path, monkeypatch):
+def test_runtime_reuse_fingerprint_ignores_volatile_temp_mounts(tmp_path, monkeypatch):
     """A mount whose host source is a per-process tempdir must not churn the
     reuse label: symlinked skills trees are served from a fresh mkdtemp copy
     every process (``_safe_skills_path``), so hashing that path made the
@@ -601,26 +575,57 @@ def test_reuse_environment_fingerprint_ignores_volatile_temp_mounts(tmp_path, mo
     temp_root.mkdir()
     monkeypatch.setattr(docker_env.tempfile, "gettempdir", lambda: str(temp_root))
     stable_source = str(tmp_path / "data")
-    process_a = docker_env._reuse_environment_fingerprint(
-        image="python:3.11",
-        mount_args=["-v", f"{temp_root}/hermes-skills-safe-a1b2c3:/root/.hermes/skills:ro",
-                    "-v", f"{stable_source}:/data:ro"],
-        hermes_home="/profiles/alpha",
+    process_a = docker_env._runtime_reuse_fingerprint(
+        ["-v", f"{temp_root}/hermes-skills-safe-a1b2c3:/root/.hermes/skills:ro",
+         "-v", f"{stable_source}:/data:ro"],
+        {},
     )
-    process_b = docker_env._reuse_environment_fingerprint(
-        image="python:3.11",
-        mount_args=["-v", f"{temp_root}/hermes-skills-safe-d4e5f6:/root/.hermes/skills:ro",
-                    "-v", f"{stable_source}:/data:ro"],
-        hermes_home="/profiles/alpha",
+    process_b = docker_env._runtime_reuse_fingerprint(
+        ["-v", f"{temp_root}/hermes-skills-safe-d4e5f6:/root/.hermes/skills:ro",
+         "-v", f"{stable_source}:/data:ro"],
+        {},
     )
     assert process_a == process_b
     # A real mount change still forces a fresh container.
-    assert process_a != docker_env._reuse_environment_fingerprint(
-        image="python:3.11",
-        mount_args=["-v", f"{temp_root}/hermes-skills-safe-a1b2c3:/root/.hermes/skills:ro",
-                    "-v", f"{tmp_path}/other-data:/data:ro"],
-        hermes_home="/profiles/alpha",
+    assert process_a != docker_env._runtime_reuse_fingerprint(
+        ["-v", f"{temp_root}/hermes-skills-safe-a1b2c3:/root/.hermes/skills:ro",
+         "-v", f"{tmp_path}/other-data:/data:ro"],
+        {},
     )
+
+
+def test_runtime_reuse_fingerprint_ignores_windows_volatile_skills_mounts(monkeypatch):
+    """A native Windows temp path keeps its drive colon when the volatile source is removed."""
+    monkeypatch.setattr(docker_env.tempfile, "gettempdir", lambda: r"C:\Temp")
+
+    process_a = docker_env._runtime_reuse_fingerprint(
+        ["-v", r"C:\Temp\hermes-skills-safe-a1b2c3:/root/.hermes/skills:ro"],
+        {},
+    )
+    process_b = docker_env._runtime_reuse_fingerprint(
+        ["-v", r"c:\temp\hermes-skills-safe-d4e5f6:/root/.hermes/skills:ro"],
+        {},
+    )
+
+    assert process_a == process_b
+
+
+def test_runtime_reuse_fingerprint_tracks_ordinary_temp_mounts(tmp_path, monkeypatch):
+    """Only generated skills copies are disposable; a user's temp bind is posture."""
+    temp_root = tmp_path / "tmp"
+    temp_root.mkdir()
+    monkeypatch.setattr(docker_env.tempfile, "gettempdir", lambda: str(temp_root))
+
+    process_a = docker_env._runtime_reuse_fingerprint(
+        ["-v", f"{temp_root}/workspace-a:/workspace"],
+        {},
+    )
+    process_b = docker_env._runtime_reuse_fingerprint(
+        ["-v", f"{temp_root}/workspace-b:/workspace"],
+        {},
+    )
+
+    assert process_a != process_b
 
 
 def test_run_command_sanitizes_unsafe_task_id(monkeypatch):
@@ -763,7 +768,7 @@ def test_symlinked_skills_tree_reuses_container_across_processes(monkeypatch, tm
     config = {"image": "python:3.11", "volumes": ["volume-a:/workspace"]}
     first = _make_dummy_env(**config)
     second = _make_dummy_env(**config)
-    assert first._labels["hermes-environment"] == second._labels["hermes-environment"]
+    assert first._labels["hermes-runtime"] == second._labels["hermes-runtime"]
     # The safe copy really is per-construction volatile: proof the stability above
     # comes from canonicalization, not from the mount happening to be stable.
     mounts = []
@@ -775,7 +780,7 @@ def test_symlinked_skills_tree_reuses_container_across_processes(monkeypatch, tm
     # A real (non-tempdir) mount change must still start a fresh container.
     changed = dict(config, volumes=["volume-b:/workspace"])
     third = _make_dummy_env(**changed)
-    assert third._labels["hermes-environment"] != first._labels["hermes-environment"]
+    assert third._labels["hermes-runtime"] != first._labels["hermes-runtime"]
 
 
 def test_labels_attribute_populated_after_init(monkeypatch):
@@ -788,20 +793,318 @@ def test_labels_attribute_populated_after_init(monkeypatch):
 
     env = _make_dummy_env(task_id="abc")
 
-    labels = dict(env._labels)
-    environment_label = labels.pop("hermes-environment")
-    assert labels == {
+    assert env._labels == {
         "hermes-agent": "1",
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-runtime": docker_env._runtime_reuse_fingerprint(
+            env._all_run_args, env._run_env_values
+        ),
     }
-    assert re.fullmatch(r"[0-9a-f]{24}", environment_label)
 
 
-@pytest.mark.parametrize("changed_setting", ["image", "volumes", "hermes_home"])
-def test_reuse_probe_filters_on_environment_fingerprint(monkeypatch, tmp_path, changed_setting):
-    """Reuse and recovery must select the requested configuration, not stale mounts."""
+def test_runtime_reuse_identity_tracks_run_args_without_exposing_them():
+    """The label changes with immutable run posture but contains no mount, env, or arg text."""
+    private_mount = "/private/operator/workspace:/workspace"
+    private_env = {"PRIVATE_TOKEN": "operator-secret-a"}
+    baseline = docker_env._runtime_reuse_fingerprint(
+        ["--network", "none", "-v", private_mount], private_env
+    )
+
+    assert baseline == docker_env._runtime_reuse_fingerprint(
+        ["--network", "none", "-v", private_mount], private_env
+    )
+    assert baseline != docker_env._runtime_reuse_fingerprint(
+        ["--network", "none"], private_env
+    )
+    assert baseline != docker_env._runtime_reuse_fingerprint(
+        ["--network", "none", "-v", private_mount],
+        {"PRIVATE_TOKEN": "operator-secret-b"},
+    )
+    assert len(baseline) == 24
+    assert set(baseline) <= set("0123456789abcdef")
+
+
+def test_runtime_reuse_identity_is_keyed(monkeypatch):
+    """A readable label must not be an offline oracle for guessed env values or host paths."""
+    args = ["--network", "none", "-v", "/private/operator/workspace:/workspace"]
+    env = {"PRIVATE_TOKEN": "operator-secret-a"}
+
+    monkeypatch.setattr(docker_env, "_runtime_reuse_key", lambda: b"a" * 32)
+    first_installation = docker_env._runtime_reuse_fingerprint(args, env)
+    monkeypatch.setattr(docker_env, "_runtime_reuse_key", lambda: b"b" * 32)
+    second_installation = docker_env._runtime_reuse_fingerprint(args, env)
+
+    assert first_installation != second_installation
+
+
+def test_runtime_reuse_identity_handles_surrogate_escaped_posture():
+    """POSIX paths and env values may contain bytes decoded through surrogateescape."""
+    label = docker_env._runtime_reuse_fingerprint(
+        ["-v", "/mnt/caf\udce9:/workspace"],
+        {"PRIVATE_TOKEN": "a\udcffb"},
+    )
+
+    assert len(label) == 24
+    assert set(label) <= set("0123456789abcdef")
+
+
+def test_runtime_reuse_key_is_private_and_stable(tmp_path):
+    """Concurrent Hermes processes need one persistent machine-local HMAC key."""
+    load_key = getattr(docker_env, "_load_or_create_runtime_reuse_key", lambda _path: None)
+    key_path = tmp_path / "docker-runtime-reuse.key"
+
+    first = load_key(key_path)
+    second = load_key(key_path)
+
+    assert isinstance(first, bytes)
+    assert len(first) == 32
+    assert second == first
+    if os.name != "nt":
+        assert key_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_runtime_reuse_key_creation_is_race_safe(tmp_path):
+    key_path = tmp_path / "docker-runtime-reuse.key"
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        keys = list(pool.map(docker_env._load_or_create_runtime_reuse_key, [key_path] * 32))
+
+    assert len(set(keys)) == 1
+    assert key_path.read_bytes() == keys[0]
+    assert not list(tmp_path.glob(f".{key_path.name}.*.tmp"))
+
+
+def test_runtime_reuse_key_rejects_fifo_without_hanging(tmp_path):
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs are not available on this platform")
+    fifo = tmp_path / "fifo-key"
+    os.mkfifo(fifo)
+    result = {}
+
+    def _load():
+        try:
+            docker_env._load_or_create_runtime_reuse_key(fifo)
+        except BaseException as exc:  # noqa: BLE001 - captured for the parent test thread
+            result["exc"] = exc
+
+    worker = threading.Thread(target=_load, daemon=True)
+    worker.start()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive(), "opening a FIFO key path blocked indefinitely"
+    assert isinstance(result.get("exc"), RuntimeError)
+    assert "not a regular file" in str(result["exc"])
+
+
+@pytest.mark.platforms("posix")
+def test_runtime_reuse_lock_opens_nonblocking(tmp_path, monkeypatch):
+    lock_path = tmp_path / ".docker-runtime-reuse.key.lock"
+
+    class _OSProxy:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def open(path, flags, *args):
+            assert path == lock_path
+            assert flags & os.O_NONBLOCK
+            raise RuntimeError("open flags verified")
+
+    monkeypatch.setattr(docker_env, "os", _OSProxy())
+
+    with pytest.raises(RuntimeError, match="open flags verified"):
+        with docker_env._RuntimeReuseFileLock(lock_path):
+            pass
+
+
+@pytest.mark.parametrize(
+    "link_errno",
+    [errno.EPERM, errno.EACCES, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS],
+)
+def test_runtime_reuse_key_falls_back_when_hardlinks_are_unsupported(
+    tmp_path, monkeypatch, link_errno
+):
+    key_path = tmp_path / "docker-runtime-reuse.key"
+    real_link = os.link
+
+    class _OSProxy:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def link(_source, _target):
+            raise OSError(link_errno, "hardlinks unsupported")
+
+    monkeypatch.setattr(docker_env, "os", _OSProxy())
+
+    first = docker_env._load_or_create_runtime_reuse_key(key_path)
+    second = docker_env._load_or_create_runtime_reuse_key(key_path)
+
+    assert os.link is real_link
+    assert second == first
+    assert key_path.read_bytes() == first
+    assert not list(tmp_path.glob(f".{key_path.name}.*.tmp"))
+
+
+def test_runtime_reuse_key_converges_without_hardlinks_under_race(tmp_path, monkeypatch):
+    """Two simultaneous fallback publishers must return one atomically published key."""
+    key_path = tmp_path / "docker-runtime-reuse.key"
+    link_barrier = threading.Barrier(2)
+    link_attempts = []
+    replace_calls = []
+
+    class _OSProxy:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def link(_source, _target):
+            link_attempts.append(threading.get_ident())
+            link_barrier.wait(timeout=5)
+            raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+        @staticmethod
+        def replace(source, target):
+            replace_calls.append((source, target))
+            return os.replace(source, target)
+
+    monkeypatch.setattr(docker_env, "os", _OSProxy())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        keys = list(pool.map(docker_env._load_or_create_runtime_reuse_key, [key_path] * 2))
+
+    assert len(link_attempts) == 2, "the fallback publishers never raced"
+    assert len(replace_calls) == 1, "more than one publisher replaced the final key"
+    assert len(set(keys)) == 1
+    assert key_path.read_bytes() == keys[0]
+    assert not list(tmp_path.glob(f".{key_path.name}.*.tmp"))
+
+
+def test_runtime_reuse_key_recovers_when_target_vanishes_after_eexist(tmp_path, monkeypatch):
+    key_path = tmp_path / "docker-runtime-reuse.key"
+    link_calls = []
+
+    class _OSProxy:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        @staticmethod
+        def link(source, target):
+            link_calls.append((source, target))
+            if len(link_calls) == 1:
+                raise FileExistsError(errno.EEXIST, "target vanished")
+            return os.link(source, target)
+
+    monkeypatch.setattr(docker_env, "os", _OSProxy())
+
+    key = docker_env._load_or_create_runtime_reuse_key(key_path)
+
+    assert len(link_calls) >= 1
+    assert key_path.read_bytes() == key
+    assert not list(tmp_path.glob(f".{key_path.name}.*.tmp"))
+
+
+def test_runtime_reuse_key_recovers_abandoned_empty_target(tmp_path):
+    key_path = tmp_path / "docker-runtime-reuse.key"
+    key_path.write_bytes(b"")
+
+    key = docker_env._load_or_create_runtime_reuse_key(key_path)
+
+    assert isinstance(key, bytes)
+    assert len(key) == 32
+    assert key_path.read_bytes() == key
+    assert docker_env._load_or_create_runtime_reuse_key(key_path) == key
+
+
+@pytest.mark.platforms("posix")
+def test_runtime_reuse_key_rejects_corrupt_and_non_regular_files(tmp_path):
+    corrupt = tmp_path / "corrupt-key"
+    corrupt.write_bytes(b"short")
+    with pytest.raises(RuntimeError, match="exactly 32 bytes"):
+        docker_env._load_or_create_runtime_reuse_key(corrupt)
+
+    directory = tmp_path / "directory-key"
+    directory.mkdir()
+    with pytest.raises(RuntimeError, match="not a regular file"):
+        docker_env._load_or_create_runtime_reuse_key(directory)
+
+
+def test_runtime_reuse_key_error_uses_safe_ephemeral_identity(monkeypatch, caplog):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(docker_env, "_RUNTIME_REUSE_KEYS", {})
+    ephemeral_keys = iter((b"a" * 32, b"b" * 32))
+
+    class _SecretsProxy:
+        def __getattr__(self, name):
+            return getattr(secrets, name)
+
+        @staticmethod
+        def token_bytes(_size):
+            return next(ephemeral_keys)
+
+    monkeypatch.setattr(docker_env, "secrets", _SecretsProxy())
+
+    def _denied(_path):
+        raise PermissionError("owner-only key cannot be written")
+
+    monkeypatch.setattr(docker_env, "_load_or_create_runtime_reuse_key", _denied)
+
+    with caplog.at_level(logging.WARNING):
+        first = _make_dummy_env(task_id="unreadable-runtime-key")
+        second = _make_dummy_env(task_id="unreadable-runtime-key")
+        docker_env._RUNTIME_REUSE_KEYS.clear()  # simulate a fresh process
+        third = _make_dummy_env(task_id="unreadable-runtime-key")
+
+    assert first._labels["hermes-runtime"] == second._labels["hermes-runtime"]
+    assert third._labels["hermes-runtime"] != first._labels["hermes-runtime"]
+    assert "cross-process Docker reuse is disabled" in caplog.text
+
+
+def test_runtime_label_excludes_image_but_tracks_env_posture(monkeypatch):
+    """Image policy runs after reuse lookup; secret-bearing env posture stays in the label."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+
+    baseline = _make_dummy_env(
+        task_id="runtime-posture", image="python:3.11", env={"PRIVATE_TOKEN": "secret-a"}
+    )
+    changed_image = _make_dummy_env(
+        task_id="runtime-posture", image="python:3.12", env={"PRIVATE_TOKEN": "secret-a"}
+    )
+    changed_env = _make_dummy_env(
+        task_id="runtime-posture", image="python:3.11", env={"PRIVATE_TOKEN": "secret-b"}
+    )
+
+    assert baseline._labels["hermes-runtime"] == changed_image._labels["hermes-runtime"]
+    assert baseline._labels["hermes-runtime"] != changed_env._labels["hermes-runtime"]
+    for other_key in ("hermes-agent", "hermes-task-id", "hermes-profile", "hermes-egress"):
+        assert baseline._labels[other_key] == changed_image._labels[other_key]
+        assert baseline._labels[other_key] == changed_env._labels[other_key]
+
+
+def test_runtime_label_changes_with_automatic_cwd_mount(monkeypatch, tmp_path):
+    """The auto-mounted host cwd is resolved before the runtime label is captured."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+
+    isolated = _make_dummy_env(task_id="cwd-posture")
+    host_bound = _make_dummy_env(
+        task_id="cwd-posture", host_cwd=str(tmp_path), auto_mount_cwd=True
+    )
+
+    assert isolated._labels["hermes-runtime"] != host_bound._labels["hermes-runtime"]
+    assert f"{tmp_path}:/workspace" not in isolated._all_run_args
+    assert f"{tmp_path}:/workspace" in host_bound._all_run_args
+
+
+def test_reuse_probe_filters_on_runtime_fingerprint(monkeypatch, tmp_path):
+    """Reuse and recovery must select the requested mount posture, not stale mounts."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "alpha"))
@@ -824,20 +1127,35 @@ def test_reuse_probe_filters_on_environment_fingerprint(monkeypatch, tmp_path, c
     _make_dummy_env(**config)
     assert reuse_filters() == original_filters
 
-    if changed_setting == "hermes_home":
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "beta"))
-    else:
-        config[changed_setting] = {"image": "python:3.12", "volumes": ["volume-b:/workspace"]}[changed_setting]
+    config["volumes"] = ["volume-b:/workspace"]
     calls.clear()
     env = _make_dummy_env(**config)
     changed_filters = reuse_filters()
     assert changed_filters != original_filters
-    assert f"label=hermes-environment={env._labels['hermes-environment']}" in changed_filters
-    assert set(f.removeprefix("label=") for f in changed_filters) <= _labels_in_run_args(_run_args_from_calls(calls))
+    requested_labels = {
+        value.removeprefix("label=") for value in changed_filters
+    }
+    requested_runtime_labels = {
+        value for value in requested_labels
+        if value.startswith("hermes-runtime=")
+    }
+    assert f"hermes-runtime={env._labels['hermes-runtime']}" in requested_runtime_labels
+    assert len(requested_runtime_labels) == 2
+    assert requested_labels - requested_runtime_labels <= _labels_in_run_args(
+        _run_args_from_calls(calls)
+    )
 
     calls.clear()
     assert env._recreate_container()
-    assert reuse_filters() == changed_filters
+    recovery_filters = reuse_filters()
+    recovery_labels = {
+        value.removeprefix("label=") for value in recovery_filters
+    }
+    assert recovery_labels <= _labels_in_run_args(_run_args_from_calls(calls))
+    assert {
+        value for value in recovery_labels
+        if value.startswith("hermes-runtime=")
+    } == {f"hermes-runtime={env._labels['hermes-runtime']}"}
 
 
 def test_shared_container_key_replaces_profile_identity(monkeypatch, tmp_path):
@@ -860,8 +1178,7 @@ def test_shared_container_key_replaces_profile_identity(monkeypatch, tmp_path):
     assert a._labels["hermes-profile"] == b._labels["hermes-profile"]
     assert a._labels["hermes-profile"] != "research"
     assert a._labels["hermes-profile"].startswith("team_workspace-")
-    # Explicit sharing retains the first creator's immutable settings.
-    assert a._labels == b._labels
+    assert a._labels["hermes-runtime"] != b._labels["hermes-runtime"]
 
 
 def test_distinct_shared_keys_never_collide(monkeypatch):
@@ -901,8 +1218,14 @@ def test_empty_shared_container_key_preserves_profile_isolation(monkeypatch):
 # ── Cross-process container reuse (issue #20561) ──────────────────
 
 
-def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
-                                     start_succeeds: bool = True):
+def _mock_subprocess_run_with_reuse(
+    monkeypatch,
+    ps_state: str | None,
+    start_succeeds: bool = True,
+    expected_runtime_label: str | None = None,
+    entrypoint_json: str | None = None,
+    container_image: str | None = None,
+):
     """Reuse-aware subprocess.run mock.
 
     ``ps_state`` controls what ``docker ps -a --filter ...`` returns:
@@ -915,6 +1238,7 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
     Returns the captured call list so the test can verify which docker
     commands actually ran.
     """
+    monkeypatch.setattr(docker_env, "_cgroup_limits_ok", True)
     calls = []
 
     def _run(cmd, **kwargs):
@@ -923,11 +1247,24 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
             sub = cmd[1]
             if sub == "version":
                 return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if cmd[1:3] == ["image", "inspect"] and entrypoint_json is not None:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{entrypoint_json}\n", stderr=""
+                )
+            if sub == "inspect" and container_image is not None:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{container_image}\n", stderr=""
+                )
             if sub == "ps":
                 if ps_state is None:
                     return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-                # 2-field format: ID, State. The egress posture is enforced
-                # by the label filters on the ps command itself (#99213).
+                if (
+                    expected_runtime_label is not None
+                    and f"label=hermes-runtime={expected_runtime_label}" not in cmd
+                ):
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                # 2-field format: ID, State. The egress and runtime posture are
+                # enforced by exact label filters on the ps command itself.
                 return subprocess.CompletedProcess(
                     cmd, 0,
                     stdout=f"reused-cid\t{ps_state}\n",
@@ -954,11 +1291,16 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     despite docs claiming "ONE long-lived container shared across sessions"."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
-    calls = _mock_subprocess_run_with_reuse(monkeypatch, ps_state="running")
+    _mock_subprocess_run(monkeypatch)
+    created = _make_dummy_env(task_id="reuse-test", persist_across_processes=False)
+    expected_runtime_label = created._labels["hermes-runtime"]
+    calls = _mock_subprocess_run_with_reuse(
+        monkeypatch, ps_state="running", expected_runtime_label=expected_runtime_label
+    )
 
     env = _make_dummy_env(task_id="reuse-test")
 
-    # The reuse path must populate _container_id from the ps probe output.
+    assert env._labels["hermes-runtime"] == expected_runtime_label
     assert env._container_id == "reused-cid", (
         f"expected reused container id, got {env._container_id!r}"
     )
@@ -972,6 +1314,184 @@ def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):
     assert not start_invocations, (
         f"docker start should be skipped when container already running, got: {start_invocations}"
     )
+
+
+def test_default_image_flip_reaches_existing_reuse_guard(monkeypatch):
+    """An unpinned default change must find the old container before image policy runs."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+    existing = _make_dummy_env(
+        task_id="default-image-flip",
+        image="old/image:1",
+        persist_across_processes=False,
+    )
+    existing_runtime_label = existing._labels["hermes-runtime"]
+    calls = _mock_subprocess_run_with_reuse(
+        monkeypatch,
+        ps_state="running",
+        expected_runtime_label=existing_runtime_label,
+    )
+    monkeypatch.setattr(
+        docker_env.DockerEnvironment,
+        "_container_image",
+        lambda self, container_id: "old/image:1",
+    )
+
+    current = _make_dummy_env(
+        task_id="default-image-flip",
+        image="python:3.11",
+    )
+
+    assert current._labels["hermes-runtime"] == existing_runtime_label
+    assert current._container_id == "reused-cid"
+    assert not any(
+        isinstance(cmd, list) and len(cmd) >= 2 and cmd[1] == "run"
+        for cmd, _kwargs in calls
+    )
+
+
+def test_default_image_flip_to_s6_reaches_existing_reuse_guard(monkeypatch):
+    """Image-derived s6 run args must not hide an old unpinned sandbox."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run_with_reuse(
+        monkeypatch, ps_state=None, entrypoint_json="null"
+    )
+    existing = _make_dummy_env(
+        task_id="default-image-s6-flip",
+        image="old/image:1",
+        persist_across_processes=False,
+    )
+    existing_runtime_label = existing._labels["hermes-runtime"]
+    _mock_subprocess_run_with_reuse(
+        monkeypatch,
+        ps_state="running",
+        expected_runtime_label=existing_runtime_label,
+        entrypoint_json='["/init"]',
+        container_image="old/image:1",
+    )
+
+    current = _make_dummy_env(
+        task_id="default-image-s6-flip",
+        image="hermes-agent:latest",
+    )
+
+    assert current._labels["hermes-runtime"] != existing_runtime_label
+    assert current._container_id == "reused-cid"
+
+
+def test_same_image_init_style_change_does_not_cross_reuse_posture(monkeypatch):
+    """An alternate-init lookup is valid only for an actual image-name transition."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run_with_reuse(
+        monkeypatch, ps_state=None, entrypoint_json="null"
+    )
+    existing = _make_dummy_env(
+        task_id="same-image-s6-flip",
+        image="mutable/image:latest",
+        persist_across_processes=False,
+    )
+    existing_runtime_label = existing._labels["hermes-runtime"]
+    _mock_subprocess_run_with_reuse(
+        monkeypatch,
+        ps_state="running",
+        expected_runtime_label=existing_runtime_label,
+        entrypoint_json='["/init"]',
+        container_image="mutable/image:latest",
+    )
+
+    current = _make_dummy_env(
+        task_id="same-image-s6-flip",
+        image="mutable/image:latest",
+    )
+
+    assert current._labels["hermes-runtime"] != existing_runtime_label
+    assert current._container_id == "fresh-cid"
+
+
+def test_uninspectable_alternate_init_match_starts_fresh(monkeypatch):
+    """A broader init-style fallback must not attach when its image cannot be verified."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run_with_reuse(
+        monkeypatch, ps_state=None, entrypoint_json="null"
+    )
+    existing = _make_dummy_env(
+        task_id="uninspectable-s6-flip",
+        image="old/image:1",
+        persist_across_processes=False,
+    )
+    existing_runtime_label = existing._labels["hermes-runtime"]
+    _mock_subprocess_run_with_reuse(
+        monkeypatch,
+        ps_state="running",
+        expected_runtime_label=existing_runtime_label,
+        entrypoint_json='["/init"]',
+    )
+
+    current = _make_dummy_env(
+        task_id="uninspectable-s6-flip",
+        image="hermes-agent:latest",
+    )
+
+    assert current._labels["hermes-runtime"] != existing_runtime_label
+    assert current._container_id == "fresh-cid"
+
+
+def test_reuse_rejects_container_from_different_mount_posture(monkeypatch):
+    """Removing a host bind must not retain it through cross-process reuse.
+
+    The terminal guard derives ``has_host_access`` from the current config. If
+    Docker reuses an older container whose bind mounts differ, the guard sees
+    an isolated sandbox while commands still reach the host.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(docker_env, "_cgroup_limits_ok", True)
+    calls = []
+    stale_runtime_label = None
+
+    def _run(cmd, **kwargs):
+        calls.append(list(cmd) if isinstance(cmd, list) else cmd)
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            if cmd[1] == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+            if cmd[1] == "ps":
+                # Model Docker's exact label filtering. The stale host-bound
+                # container is visible only if the requested runtime label is
+                # identical to the one captured under the old mount posture.
+                stale_filter = f"label=hermes-runtime={stale_runtime_label}"
+                stdout = (
+                    "stale-host-bound\trunning\n"
+                    if stale_runtime_label is not None and stale_filter in cmd
+                    else ""
+                )
+                return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+            if cmd[1] == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fresh-container\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+
+    host_bound = _make_dummy_env(
+        task_id="mount-posture",
+        volumes=["/private/operator/workspace:/workspace"],
+        persist_across_processes=False,
+    )
+    stale_runtime_label = host_bound._labels["hermes-runtime"]
+    calls.clear()
+
+    isolated = _make_dummy_env(task_id="mount-posture", volumes=[])
+
+    assert isolated._labels["hermes-runtime"] != stale_runtime_label
+    assert isolated._container_id == "fresh-container"
+    ps_call = next(cmd for cmd in calls if isinstance(cmd, list) and cmd[1] == "ps")
+    run_call = next(cmd for cmd in calls if isinstance(cmd, list) and cmd[1] == "run")
+    runtime_label = isolated._labels["hermes-runtime"]
+    assert f"label=hermes-runtime={runtime_label}" in ps_call
+    assert f"hermes-runtime={runtime_label}" in run_call
 
 
 def test_egress_enabled_does_not_reuse_pre_egress_container(monkeypatch):
