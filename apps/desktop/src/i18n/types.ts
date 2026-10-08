@@ -3760,6 +3760,13 @@ export interface Translations extends NoticeTranslations {
       modelPinned: string
       modelTitle: (provider: string, model: string) => string
       providerModelTitle: (provider: string, model: string) => string
+      workhorse: {
+        openPicker: string
+        inherit: string
+        noModel: string
+        modelTitle: (provider: string, model: string) => string
+        effortInherit: string
+      }
     }
   }
 
