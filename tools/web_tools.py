@@ -282,8 +282,8 @@ def _ensure_web_plugins_loaded() -> None:
     configured and ``FIRECRAWL_API_KEY`` set. See #27580.
     """
     try:
-        from hermes_cli.plugins import _ensure_plugins_discovered
-        _ensure_plugins_discovered()
+        from plugin_runtime.lifecycle import ensure_plugins_discovered
+        ensure_plugins_discovered()
     except Exception as exc:  # noqa: BLE001
         # Warning, not debug: a broken plugin import is otherwise invisible.
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)

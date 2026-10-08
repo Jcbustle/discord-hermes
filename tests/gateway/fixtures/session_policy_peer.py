@@ -23,7 +23,7 @@ class Peer(BaseHTTPRequestHandler):
         message = {'role': 'assistant', 'content': 'POLICY_DONE'}
         if not done:
             message = {'role': 'assistant', 'content': None, 'tool_calls': [
-                {'id': 'owned-' + str(body.get('model')), 'type': 'function', 'function': {'name': 'terminal',
+                {'id': 'owned', 'type': 'function', 'function': {'name': 'terminal',
                  'arguments': json.dumps({'command': 'pwd; printf owned > policy-proof.txt'})}}]}
         payload = json.dumps({'id': 'policy', 'object': 'chat.completion', 'model': body.get('model'),
                               'choices': [{'index': 0, 'message': message, 'finish_reason': 'stop' if done else 'tool_calls'}],
@@ -42,19 +42,6 @@ class Peer(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
-
-
-def _names_cwd(content, cwd):
-    """True when the terminal tool's own output names ``cwd`` in any spelling its shell uses."""
-    try:
-        content = json.loads(content)['output']
-    except (TypeError, ValueError, KeyError):
-        content = str(content)
-    forms = {str(cwd), cwd.as_posix()}
-    if os.name == 'nt' and cwd.drive:
-        forms.add('/' + cwd.drive[0].lower() + cwd.as_posix()[len(cwd.drive):])
-        return any(form.lower() in content.lower() for form in forms)
-    return any(form in content for form in forms)
 
 
 async def probe(peer):
@@ -124,13 +111,22 @@ async def probe(peer):
             assert agent is not None, (source, list(runner._agent_cache), peer.requests, await rpc(ws, 'session.resume', session_id=sid))
             assert agent.platform == {'cli': 'cli', 'tui': 'tui', 'gui': 'desktop'}[source], vars(agent).get('platform')
             cwd = Path(os.environ['HERMES_HOME'], source)
-            requests = [r for r in peer.requests if r.get('model') == 'policy-' + source]
-            tool_results = [m for r in requests for m in r['messages'] if m['role'] == 'tool']
-            assert (cwd / 'policy-proof.txt').is_file(), (source, str(cwd), tool_results)
             assert (cwd / 'policy-proof.txt').read_text() == 'owned'
+            requests = [r for r in peer.requests if r.get('model') == 'policy-' + source]
             assert len(requests) >= 2, peer.requests
-            # Git Bash prints the MSYS form (/c/Users/...) on Windows; json.dumps doubles backslashes.
-            assert any(_names_cwd(m.get('content'), cwd) for m in tool_results), (source, str(cwd), tool_results)
+            # Terminal returns pwd in output, possibly in MSYS /c/... form.
+            tool_results = [json.loads(m['content']) for r in requests
+                            for m in r['messages'] if m['role'] == 'tool']
+            native = str(cwd.resolve()).replace('\\', '/').rstrip('/')
+            equivalents = {native}
+            if os.name == 'nt' and len(native) >= 2 and native[1] == ':':
+                equivalents.add('/' + native[0].lower() + native[2:])
+            def matches_cwd(value):
+                reported = str(value or '').strip().replace('\\', '/').rstrip('/')
+                if os.name == 'nt':
+                    return reported.casefold() in {s.casefold() for s in equivalents}
+                return reported in equivalents
+            assert any(matches_cwd(result.get('output')) for result in tool_results), tool_results
             names = {t['function']['name'] for t in requests[0]['tools']}
             assert 'terminal' in names
             assert ('desktop_ui' in agent.enabled_toolsets) == (source == 'gui')

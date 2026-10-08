@@ -1,6 +1,5 @@
 """Frozen, explicit local-client launch policy for the existing TurnRunner."""
 from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -11,7 +10,6 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'provider', 'base_url', 'reasoning', 'max_turns', 'ignore_rules', 'api_key', 'editor',
                            'yolo', 'safe_mode', 'ignore_user_config'})
 BYPASS_FIELDS = ('safe_mode', 'ignore_user_config')
-_ACTIVE_POLICY: ContextVar = ContextVar('local_session_policy', default=None)
 SURFACES = {'cli': 'cli', 'tui': 'tui', 'gui': 'desktop', 'acp': 'acp'}
 
 
@@ -85,6 +83,9 @@ def present_sections(config):
 
 
 def build_policy(params, config, *, private_secrets=None, profile_terminal=True):
+    from hermes_cli.config import has_xai_tool_credentials
+    from tools.platform_policy import get_platform_tools
+    from toolsets import validate_toolset
     from agent.runtime_cwd import resolve_agent_cwd
     from tools.terminal_scope import build_profile_terminal_scope, default_terminal_scope
     from hermes_constants import get_hermes_home
@@ -110,23 +111,6 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True)
     from gateway.session_local_editor import validate_editor
     validate_editor(source, params.get('editor'))
     config = present_sections(json.loads(json.dumps(config)))
-    _apply_launch_overrides(params, config)
-    enabled = _resolve_toolsets(params, config, source, safe_mode)
-    terminal = build_profile_terminal_scope(get_hermes_home()) if profile_terminal else default_terminal_scope()
-    terminal['TERMINAL_CWD'] = cwd
-    request = {k: v for k, v in params.items() if k not in {'request_id', 'api_key'}}
-    request.setdefault('source', 'cli')
-    from gateway.session_local_mcp import private_editor_request
-    private_editor_request(request, private_secrets)
-    _extract_config_secrets(config, private_secrets)
-    _extract_config_secrets(terminal, private_secrets, (None,))
-    return LocalSessionPolicy(source, SURFACES[source], cwd, model, tuple(sorted(enabled)),
-                              json.dumps(config), json.dumps(request, sort_keys=True), json.dumps(terminal),
-                              safe_mode=safe_mode, ignore_user_config=ignore_user_config)
-
-
-def _apply_launch_overrides(params, config):
-    """Validate the explicit model/agent launch overrides and fold them into *config*."""
     from urllib.parse import urlsplit
     from hermes_cli.config import resolve_turn_limit
     from hermes_constants import parse_reasoning_effort
@@ -158,19 +142,13 @@ def _apply_launch_overrides(params, config):
         config.setdefault('agent', {})['reasoning_effort'] = params['reasoning']
         # An explicit launch level wins over a per-model default, just like CLI.
         config['agent'].pop('reasoning_overrides', None)
-
-
-def _resolve_toolsets(params, config, source, safe_mode):
-    """Validate explicit toolsets and return the session's enabled toolset set."""
-    from hermes_cli.tools_config import _get_platform_tools
-    from toolsets import validate_toolset
     explicit = params.get('toolsets')
     if 'toolsets' in params:
         if (not isinstance(explicit, list) or any(not isinstance(x, str) or not validate_toolset(x) for x in explicit)
                 or ('desktop_ui' in explicit and source != 'gui')):
             raise RuntimeStoreError('invalid_params')
         config.setdefault('platform_toolsets', {})['acp' if source == 'acp' else 'cli'] = explicit
-    enabled = _get_platform_tools(config, 'acp' if source == 'acp' else 'cli')
+    enabled = get_platform_tools(config, 'acp' if source == 'acp' else 'cli', xai_credentials_present=has_xai_tool_credentials)
     if explicit is not None:
         from toolsets import resolve_toolset
         requested = {t for name in explicit for t in resolve_toolset(name)}
@@ -179,19 +157,30 @@ def _resolve_toolsets(params, config, source, safe_mode):
             raise RuntimeStoreError('invalid_params')
     elif source in {'tui', 'gui'}:
         # Same surface toolsets as the native TUI factory, without its env inference.
-        # The fold-in lands after _get_platform_tools subtracted agent.disabled_toolsets, so
+        # The fold-in lands after get_platform_tools subtracted agent.disabled_toolsets, so
         # subtract again or `disabled_toolsets: [project]` is a no-op here (#54433).
         # desktop_ui is the client's own control surface, not a model toolset.
         from agent.skill_utils import parse_config_string_list
-        from toolsets import CLIENT_SURFACE_TOOLSETS
         disabled = set(parse_config_string_list((config.get('agent') or {}).get('disabled_toolsets')))
-        surface = set(CLIENT_SURFACE_TOOLSETS) if source == 'gui' else {'project'}
-        enabled |= surface - (disabled - {'desktop_ui'})
+        if 'project' not in disabled:
+            enabled.add('project')
+        if source == 'gui':
+            enabled.add('desktop_ui')
     if safe_mode:
         # Plugin toolsets are user customizations; the safe worker never imports them.
-        from hermes_cli.tools_config import _get_plugin_toolset_keys
-        enabled -= _get_plugin_toolset_keys()
-    return enabled
+        from tools.platform_policy import get_plugin_toolset_keys
+        enabled -= get_plugin_toolset_keys()
+    terminal = build_profile_terminal_scope(get_hermes_home()) if profile_terminal else default_terminal_scope()
+    terminal['TERMINAL_CWD'] = cwd
+    request = {k: v for k, v in params.items() if k not in {'request_id', 'api_key'}}
+    request.setdefault('source', 'cli')
+    from gateway.session_local_mcp import private_editor_request
+    private_editor_request(request, private_secrets)
+    _extract_config_secrets(config, private_secrets)
+    _extract_config_secrets(terminal, private_secrets, (None,))
+    return LocalSessionPolicy(source, SURFACES[source], cwd, model, tuple(sorted(enabled)),
+                              json.dumps(config), json.dumps(request, sort_keys=True), json.dumps(terminal),
+                              safe_mode=safe_mode, ignore_user_config=ignore_user_config)
 
 
 def _extract_config_secrets(value, private, path=()):
@@ -321,19 +310,11 @@ def policy_scope(policy, *, authority=None):
                 terminal[path[1]] = value
     cwd_token = set_session_cwd(policy.cwd)
     terminal_token = set_terminal_scope(terminal)
-    policy_token = _ACTIVE_POLICY.set(policy)
     from gateway.session_local_editor import editor_scope
     try:
         from gateway.session_local_mcp import editor_mcp_scope
         with editor_scope(policy), editor_mcp_scope(authority, policy):
             yield
     finally:
-        _ACTIVE_POLICY.reset(policy_token)
         reset_terminal_scope(terminal_token)
         cwd_token.var.reset(cwd_token)
-
-
-def active_policy():
-    """The frozen launch policy of the turn executing in this context, or ``None`` (standalone
-    serve / messaging turns). Consumers read it instead of re-deriving from live config."""
-    return _ACTIVE_POLICY.get()
