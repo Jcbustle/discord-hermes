@@ -263,6 +263,55 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
+def _agent_with_provider(name, schemas):
+    agent = _FakeAgent()
+    mm = MagicMock()
+    mm.prefetch_all.return_value = "REMEMBERED CONTEXT"
+    provider = MagicMock()
+    provider.name = name
+    provider.get_tool_schemas.return_value = schemas
+    mm.providers = [provider]
+    agent._memory_manager = mm
+    return agent, mm
+
+
+def test_prefetch_dropped_from_user_channel_when_provider_has_tools():
+    """#8893: a provider that puts memory tools on the surface delivers recalled
+    memory through them, so the turn's prefetch must not also ride the user
+    message — fenced or not, the model drifts toward it instead of the question."""
+    agent, mm = _agent_with_provider("supermemory", [{"name": "memory_search"}])
+    ctx = _build(agent, user_message="what did we decide about the deploy pipeline?")
+
+    mm.prefetch_all.assert_called_once()
+    assert ctx.ext_prefetch_cache == ""
+    msg = ctx.messages[ctx.current_turn_user_idx]
+    assert "api_content" not in msg
+    assert "<memory-context>" not in msg["content"]
+
+
+def test_prefetch_kept_when_provider_has_no_tool_surface():
+    """#125802 review: hindsight ``memory_mode=context`` / honcho
+    ``recall_mode=context`` expose no tools and carry only a static prompt header,
+    so the prefetch is their ONLY delivery path. Dropping it there fetched the
+    recalled text and silently lost it."""
+    agent, _ = _agent_with_provider("hindsight", [])
+    ctx = _build(agent, user_message="what did we decide about the deploy pipeline?")
+
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+    assert "<memory-context>" in ctx.messages[ctx.current_turn_user_idx]["api_content"]
+
+
+def test_prefetch_kept_when_memory_tools_are_gated_off():
+    """Tool schemas exist, but the ``memory`` toolset is gated off — the provider's
+    prompt block and tools are withheld together, so nothing else can deliver the
+    prefetch and it stays user-bound."""
+    agent, _ = _agent_with_provider("supermemory", [{"name": "memory_search"}])
+    agent.enabled_toolsets = []
+    ctx = _build(agent, user_message="what did we decide about the deploy pipeline?")
+
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+
+
 # ── Per-turn author ──────────────────────────────────────────────────────────
 
 

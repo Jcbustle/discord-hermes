@@ -114,6 +114,37 @@ def memory_provider_tools_exposed(agent: Any) -> bool:
     return memory_provider_tools_enabled(enabled, disabled, memory_tool_present=present)
 
 
+def memory_prefetch_has_other_surface(agent: Any) -> bool:
+    """Whether recalled memory reaches the model without the user-message channel.
+
+    ``True`` only when every active (non-builtin) provider exposes tool schemas *and*
+    those memory tools are actually on the model's tool surface. A provider in a
+    context-only mode exposes none — hindsight ``memory_mode=context`` and honcho
+    ``recall_mode=context`` both return ``[]`` from ``get_tool_schemas()`` and carry
+    only a static header from ``system_prompt_block()`` — so the turn's prefetch is
+    that provider's sole delivery path and must stay user-bound (#125802 review).
+
+    Anything uncertain answers ``False``: keeping the prefetch where it has always
+    been is the safe side, since a wrong ``True`` drops recalled text silently.
+    """
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is None:
+        return False
+    try:
+        if not memory_provider_tools_exposed(agent):
+            return False
+        providers = [
+            p for p in (getattr(manager, "providers", None) or [])
+            if getattr(p, "name", "") != "builtin"
+        ]
+        if not providers:
+            return False
+        return all(p.get_tool_schemas() for p in providers)
+    except Exception:
+        logger.debug("memory prefetch delivery probe failed; keeping it user-bound", exc_info=True)
+        return False
+
+
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface; return count added."""
     memory_manager = getattr(agent, "_memory_manager", None)

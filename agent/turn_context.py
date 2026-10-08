@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, memory_prefetch_has_other_surface
 from agent.memory_provider import is_trivial_prompt
 from agent.message_content import flatten_message_text
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
@@ -897,7 +897,17 @@ def _memory_turn_start_and_prefetch(
 ) -> str:
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
-    Returns the prefetch text (``""`` when nothing was injected)."""
+    Returns the prefetch text (``""`` when nothing was injected).
+
+    #8893: the prefetch is dropped from the user-message channel *only* when the
+    provider has another surface to deliver it through (memory tools on the model's
+    tool surface). A context-only provider — hindsight ``memory_mode=context``,
+    honcho ``recall_mode=context`` — exposes no tools and carries only a static
+    header in its prompt block, so this prefetch is its sole delivery path: the
+    recalled text must stay user-bound there or it is fetched and silently lost
+    (#125802 review). The gate is conservative — anything uncertain keeps the
+    prefetch where it has always been.
+    """
     if not agent._memory_manager:
         return ""
     _query = _memory_query_text(original_user_message)
@@ -913,6 +923,8 @@ def _memory_turn_start_and_prefetch(
     with suppress(Exception):
         if not is_trivial_prompt(_query):
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+    if ext_prefetch_cache and memory_prefetch_has_other_surface(agent):
+        ext_prefetch_cache = ""
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
