@@ -110,6 +110,11 @@ VALID_HOOKS: Set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
     "transform_llm_output", "pre_llm_call", "post_llm_call",
+    # Observer-only memory-provider prefetch boundary. Fired only when the
+    # operation produced at least one bounded structured observation; the
+    # result is immutable and may contain raw recalled context, so plugins
+    # must opt in deliberately and must not treat this as outbound telemetry.
+    "memory_prefetch",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.
     "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
@@ -203,9 +208,16 @@ VALID_HOOKS: Set[str] = {
     "pre_command",
 }
 
-# Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
-# the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+# Hooks that the shell-hook bridge cannot safely carry. Most entries have a
+# directive that ``agent/shell_hooks._parse_response`` cannot represent;
+# ``memory_prefetch`` is the in-process Python-plugin event whose immutable
+# observation tuple must not be stringified across a subprocess boundary.
+# ``VALID_HOOKS`` doubles as the shell-hook config allow-list, so registration
+# is refused loudly.
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "transform_api_error_classification",
+    "memory_prefetch",
+}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()
@@ -1160,6 +1172,9 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # matches the key the registries store under (normcase on Windows).
         self.scope_key = hermes_home_key(scope_key)
         self.home_path = Path(self.scope_key)
+        # Observer dispatchers use a per-manager lifetime token, rotated on unload-all so an
+        # old queued event can never attach to a reloaded manager instance.
+        self._observer_dispatcher_scope = object()
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
@@ -1591,6 +1606,8 @@ _plugin_manager: Optional[PluginManager] = None
 # into another, and keying by resolved home lets a re-entered profile reuse its imported modules.
 _plugin_managers_by_home: Dict[Path, PluginManager] = {}
 _plugin_managers_lock = threading.RLock()
+_plugin_manager_teardown_condition = threading.Condition(_plugin_managers_lock)
+_plugin_manager_teardown_owners: Dict[Path, Tuple[int, Optional[PluginManager]]] = {}
 
 # Process-wide messaging-gateway host. A multiplexed gateway owns one scheduler while plugins are
 # isolated in per-profile managers, so every manager in this process must see the same live host.
@@ -1703,18 +1720,29 @@ def get_plugin_manager() -> PluginManager:
     profile switch gets its own manager and plugin submodules)."""
     global _plugin_manager
     current_home = _plugin_home_key()
-    with _plugin_managers_lock:
-        # Tests/embedders monkeypatch ``_plugin_manager`` directly: adopt a single-slot manager the
-        # keyed cache doesn't know about at all.
-        if _plugin_manager is not None and _plugin_manager not in _plugin_managers_by_home.values():
-            _plugin_managers_by_home[current_home] = _plugin_manager
-            manager = _plugin_manager
+    thread_id = threading.get_ident()
+    with _plugin_manager_teardown_condition:
+        while current_home in _plugin_manager_teardown_owners:
+            owner, tearing_down = _plugin_manager_teardown_owners[current_home]
+            if owner == thread_id:
+                manager = tearing_down
+                if manager is None:
+                    from hermes_cli.plugins_lifecycle import _get_or_create_reentrant_manager
+                    manager = _get_or_create_reentrant_manager(current_home, thread_id)
+                break
+            _plugin_manager_teardown_condition.wait()
         else:
-            manager = _plugin_managers_by_home.get(current_home)
-            if manager is None:
-                manager = PluginManager(scope_key=hermes_home_key(current_home))
-                _plugin_managers_by_home[current_home] = manager
-            _plugin_manager = manager
+            # Tests/embedders monkeypatch ``_plugin_manager`` directly: adopt a single-slot manager the
+            # keyed cache doesn't know about at all.
+            if _plugin_manager is not None and _plugin_manager not in _plugin_managers_by_home.values():
+                _plugin_managers_by_home[current_home] = _plugin_manager
+                manager = _plugin_manager
+            else:
+                manager = _plugin_managers_by_home.get(current_home)
+                if manager is None:
+                    manager = PluginManager(scope_key=hermes_home_key(current_home))
+                    _plugin_managers_by_home[current_home] = manager
+                _plugin_manager = manager
     _attach_published_gateway_host(manager)
     _attach_published_tui_host(manager)
     return manager
@@ -1757,44 +1785,13 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
 def discover_plugins(force: bool = False) -> None:
     """Discover and load all plugins (idempotent; ``force=True`` rescans). Joins an in-flight
     background discovery instead of racing a second scan."""
-    _join_background_discovery()
+    from hermes_cli.plugins_discovery import join_background_discovery
+    join_background_discovery()
     get_plugin_manager().discover_and_load(force=force)
 
 
 _background_discovery_thread: Optional[threading.Thread] = None
 _background_discovery_lock = threading.Lock()
-
-
-def start_background_plugin_discovery() -> None:
-    """Run discovery in a daemon thread to overlap the rest of CLI startup (~150ms). Every
-    synchronous consumer joins it via :func:`discover_plugins`, so no one sees a half-loaded
-    registry. No-op when already done or in flight."""
-    global _background_discovery_thread
-    manager = get_plugin_manager()
-    if manager._discovered:
-        return
-    with _background_discovery_lock:
-        if _background_discovery_thread is not None and _background_discovery_thread.is_alive():
-            return
-
-        def _run() -> None:
-            try:
-                manager.discover_and_load()
-                _persist_plugin_toolset_keys()
-            except Exception:
-                logger.warning("background plugin discovery failed", exc_info=True)
-
-        _background_discovery_thread = threading.Thread(target=_run, name="plugin-discovery", daemon=True)
-        _background_discovery_thread.start()
-
-
-def _join_background_discovery(timeout: float = 30.0) -> None:
-    """Wait for an in-flight background discovery (no-op from its own thread or a plugin-load worker it
-    spawned — that worker's parent is blocked waiting on it)."""
-    t = _background_discovery_thread
-    if t is None or not t.is_alive() or t is threading.current_thread() or in_plugin_load_worker():
-        return
-    t.join(timeout=timeout)
 
 
 def _plugin_toolset_keys_cache_path() -> Path:
@@ -1856,7 +1853,8 @@ def _delivery_manager() -> PluginManager:
     """
     manager = get_plugin_manager()
     if not getattr(manager, "_discovered", True):
-        _join_background_discovery()
+        from hermes_cli.plugins_discovery import join_background_discovery
+        join_background_discovery()
         manager.discover_and_load()
     return manager
 
