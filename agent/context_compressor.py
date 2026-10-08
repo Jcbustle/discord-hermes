@@ -2185,9 +2185,26 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
     def on_session_reset(self) -> None:
         """Reset all per-session state for /new or /reset (also resets micro-compaction)."""
         super().on_session_reset()
+        self._restore_declared_context_window()
         self._reset_session_compaction_state()
         self._reset_micro_compact_cursor_state()
         self._micro_compact_passes = self._micro_compact_tokens_saved_total = self._micro_compact_turns_since_pass = 0
+
+    def _restore_declared_context_window(self) -> None:
+        """Put the DECLARED window back after a session-scoped recovery reduction.
+
+        A reduction installed by reduce_context_window_temporarily() answers "how much may this
+        session use while the provider gate is up"; it is not what the model declares. A fresh
+        conversation must start from the declared window, or the reduction silently outlives the
+        session that earned it (and its threshold, tail and summary budgets with it).
+        """
+        declared = getattr(self, "_declared_context_length", None)
+        if not declared or declared == self._resolved_context_length:
+            return
+        self.update_model(
+            model=self.model, context_length=declared, base_url=self.base_url,
+            api_key=self.api_key, provider=self.provider, api_mode=self.api_mode,
+        )
 
     def _reset_micro_compact_cursor_state(self) -> None:
         """Forget the rolling micro summary and its cursor/failure bookkeeping."""
@@ -2287,6 +2304,7 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
                 config_context_length=self._config_context_length, provider=self.provider,
                 custom_providers=self.custom_providers,
             )
+            self._declared_context_length = self._resolved_context_length
             # Raise-only small-context floor; must run after context_length resolves and before threshold_tokens derives.
             self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent)
             self._emit_init_summary_once()
@@ -2298,6 +2316,14 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
 
     @context_length.setter
     def context_length(self, value: int) -> None:
+        # An explicit assignment is a real window for this runtime (a model switch, a grown local
+        # window, a provider-reported limit), so it becomes the declared base — INCLUDING when the
+        # number is unchanged. A switch to a model whose declared window happens to equal the current
+        # effective one (after a tier cap, haiku's 200K is exactly the tier limit) still moves the
+        # declaration to the new model; skipping it here would let /new restore the PREVIOUS model's
+        # base. Only the session-scoped reductions in reduce_context_window_temporarily() leave the
+        # base alone, and they put the recorded base back right after their update_model() call.
+        self._declared_context_length = value
         # Re-assigning the SAME window must not wipe runtime corrections to derived budgets.
         if value == getattr(self, "_resolved_context_length", None):
             return
@@ -2766,6 +2792,27 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         """The trigger ``update_model`` would install, without mutating state."""
         return self._derive_trigger(model, context_length, provider)[2]
 
+    def reduce_context_window_temporarily(self, cap: int) -> int:
+        """Lower the window for THIS session only, keeping the declared base intact.
+
+        A provider gate that lifts on its own (an Anthropic long-context-tier 429) is not the
+        model's capability, so it must not become the window a fresh conversation inherits:
+        ``on_session_reset()`` (``/new``, ``/reset``) puts the declared window back. Returns the
+        window it replaced.
+        """
+        previous = self.context_length
+        if previous <= cap:
+            return previous
+        # update_model() assigns through the context_length setter, which records a real window
+        # as the declared base; put the previous base back so the session boundary can restore it.
+        declared = getattr(self, "_declared_context_length", None) or previous
+        self.update_model(
+            model=self.model, context_length=cap, base_url=self.base_url,
+            api_key=self.api_key, provider=self.provider, api_mode=self.api_mode,
+        )
+        self._declared_context_length = declared
+        return previous
+
     def update_model(
         self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "",
         api_mode: str = "", max_tokens: int | None = None,
@@ -2970,6 +3017,10 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         self._config_context_length = config_context_length
         self._configured_threshold_percent = self.threshold_percent
         self._resolved_context_length: int | None = None
+        # The window this runtime DECLARES, as opposed to the one a session-scoped recovery
+        # reduction is currently working under. Equal to _resolved_context_length except while a
+        # temporary reduction is installed; on_session_reset() restores it.
+        self._declared_context_length: int | None = None
         self._threshold_tokens = self._tail_token_budget = self._max_summary_tokens = None
         self.compression_count = 0
         # The init log reports resolved budgets; emit it on first resolution to keep construction non-blocking.
