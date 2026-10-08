@@ -3825,6 +3825,7 @@ export interface Translations extends NoticeTranslations {
     openPreview: string
     openInBrowser: string
     openInExternal: string
+    openWithSystemApp: string
     popIn: string
     popOut: string
     linkHint: string
