@@ -31,6 +31,7 @@ import { LiveAgentsPanel } from './agentsPanel.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
 import { FloatingOverlays, PromptZone } from './appOverlays.js'
 import { Banner, Panel, SessionPanel } from './branding.js'
+import { ComposerRail } from './composerRail.js'
 import { FpsOverlay } from './fpsOverlay.js'
 import { GoalBar } from './goalBar.js'
 import { HelpHint } from './helpHint.js'
@@ -326,6 +327,9 @@ const ComposerPane = memo(function ComposerPane({
 
   const promptWidth = composerPromptWidth(promptText)
   const promptBlank = ' '.repeat(promptWidth)
+  // The rail hangs in the pane's own left margin, so the draft keeps the exact
+  // column budget it had before the rail existed (see composerRail.tsx).
+  const railWidth = Math.max(1, composer.cols - 1)
   const inputColumns = stableComposerColumns(composer.cols, promptWidth, TERMUX_TUI_MODE)
   const inputHeight = inputVisualHeight(composer.input, inputColumns)
   const inputMouseRef = useRef<null | TextInputMouseApi>(null)
@@ -427,7 +431,7 @@ const ComposerPane = memo(function ComposerPane({
         {!nativeMode && composer.input === '?' && !composer.inputBuf.length && <HelpHint t={ui.theme} />}
 
         {!isBlocked && (
-          <>
+          <ComposerRail color={sh ? ui.theme.color.shellDollar : ui.theme.color.prompt} width={railWidth}>
             {composer.inputBuf.map((line, i) => (
               <Box key={i}>
                 <Box width={promptWidth}>
@@ -486,7 +490,7 @@ const ComposerPane = memo(function ComposerPane({
                 <GoodVibesHeart t={ui.theme} tick={status.goodVibesTick} />
               </Box>
             </Box>
-          </>
+          </ComposerRail>
         )}
       </Box>
 
