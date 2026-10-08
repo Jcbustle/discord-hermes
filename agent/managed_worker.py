@@ -265,7 +265,7 @@ def tool_frame(call_id, name, args, *result):
 
 def execute(frame, channel):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
-    # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
+    # plugin_runtime) transitively; the policy must already be frozen when they load.
     bind_bypass_policy(frame)
     from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC
     scope = dict(frame['scope'])
