@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import NoReturn
 
 # Old updaters load _no_prompt_git_kwargs from here after the checkout swap (frozen surface).
-from hermes_cli._subprocess_compat import no_prompt_git_kwargs as _no_prompt_git_kwargs
+from runtime.git_subprocess import no_prompt_git_kwargs as _no_prompt_git_kwargs
 from hermes_cli.config import get_hermes_home  # noqa: F401  (re-exported; patched via update_cmd)
 from hermes_cli import update_handoff as _update_handoff
 from hermes_cli.update_cmd_common import _best_effort, _record_stop
@@ -264,7 +264,7 @@ def _git_run(git_cmd, args, cwd=None, *, check=False, network=False):
 
     Every spawn carries ``windows_hide_flags()``: the updater's git children run under the
     console-less desktop backend, and a bare spawn flashes a console window each (#117781)."""
-    from hermes_cli._subprocess_compat import windows_hide_flags
+    from runtime.subprocess_compat import windows_hide_flags
     # ``_no_prompt_git_kwargs()`` already carries the hide flags for network
     # calls, so layer them instead of passing the keyword twice.
     spawn_kwargs = {"timeout": NETWORK_GIT_TIMEOUT_SECONDS, **_no_prompt_git_kwargs()} if network else {}
@@ -581,7 +581,8 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     """Stream combined build output to update.log, retaining it for failure reporting."""
     import codecs
     import io
-    from hermes_cli._subprocess_compat import kill_process_tree, windows_hide_flags
+    from runtime.processes import kill_popen_process_tree
+    from runtime.subprocess_compat import windows_hide_flags
 
     child_env = dict(os.environ if env is None else env)
     child_env.setdefault("PYTHONUNBUFFERED", "1")
@@ -604,7 +605,7 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
         return subprocess.CompletedProcess(cmd, proc.wait(), stdout="".join(output))
     except BaseException:
         # Unlike Popen.__exit__, do not wait for a cancelled build to finish.
-        kill_process_tree(proc)
+        kill_popen_process_tree(proc)
         with suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
         raise
@@ -1596,7 +1597,7 @@ def _prepare_git_command(*, checkout_move=None) -> tuple[bool, list, bool]:
         _record_stop("not_git_checkout")
         sys.exit(1)
 
-    from hermes_cli._subprocess_compat import expose_pm_git
+    from runtime.git_subprocess import expose_pm_git
 
     expose_pm_git(_m().PROJECT_ROOT)
     git_cmd = _base_git_cmd()

@@ -15,6 +15,11 @@ _BLOCKING_CONTROL_EVENTS = frozenset({
 })
 
 
+_BLOCKING_CONTROL_EVENTS = frozenset({
+    "approval.request", "approval.settled", "clarify.request", "clarify.settled",
+})
+
+
 class GatewayChatView:
     def __init__(self, client, snapshot, *, quiet=False, emitter=None, usage_file=None):
         self.usage_file = usage_file
