@@ -235,6 +235,29 @@ interface ApprovalCardProps {
   stack: CardStackAction
 }
 
+/** The guardian LLM's own words on why a command escalated ('' / absent = nothing to
+ * show). Kept out of ApprovalCard so the card keeps its shape, and deliberately not
+ * localised: the reason is the guardian's English output, not a UI string.
+ * (#133398: the card used to show only the detector category, e.g. "script execution
+ * via -c flag", which tells the user nothing about the actual risk.) */
+function ApprovalReasonRow({ text }: { text?: string }) {
+  const reason = text?.trim()
+
+  if (!reason) {
+    return null
+  }
+
+  return (
+    <div
+      className="flex items-start gap-1.5 px-2.5 pb-1 text-xs leading-relaxed text-(--ui-text-secondary)"
+      data-slot="tool-approval-reason"
+    >
+      <Codicon className="mt-0.5 shrink-0" name="warning" size="0.875rem" />
+      <span>{reason}</span>
+    </div>
+  )
+}
+
 const ApprovalCard: FC<ApprovalCardProps> = ({ request, total, position, stack }) => {
   const { t } = useI18n()
   const copy = t.assistant.approval
@@ -343,8 +366,9 @@ const ApprovalCard: FC<ApprovalCardProps> = ({ request, total, position, stack }
           </span>
         )}
       </div>
+      <ApprovalReasonRow text={request.smartReason} />
       {details.length > 0 && (
-        <pre className="m-0 max-h-40 overflow-auto whitespace-pre-wrap break-words px-2.5 py-2 font-mono text-xs leading-relaxed text-(--ui-text-primary)">
+        <pre className="m-0 max-h-64 overflow-auto whitespace-pre-wrap break-words px-2.5 py-2 font-mono text-xs leading-relaxed text-(--ui-text-primary)">
           {details}
         </pre>
       )}
