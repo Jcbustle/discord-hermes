@@ -85,12 +85,12 @@ def _native_vision_result(
 def _analyze_screenshot_with_aux_llm(screenshot_path: Path, question: str) -> str:
     """One-shot aux vision-LLM analysis (not baked into history), secret-redacted.
 
-    Full resolution first; on a size-related provider rejection the image is
-    downscaled once and retried. ``auxiliary.vision.timeout/temperature`` — local
-    vision models can take well over 30s, so the default timeout is generous.
+    The payload is bounded to the vision embed budget before the request (same as
+    the native arm in ``_native_vision_result``); a size-related provider rejection
+    still triggers one extra downscale-and-retry as a safety net.
+    ``auxiliary.vision.timeout/temperature`` — local vision models can take well
+    over 30s, so the default timeout is generous.
     """
-    import base64
-
     vision_prompt = (
         f"You are analyzing a screenshot of a web browser.\n\n"
         f"User's question: {question}\n\n"
@@ -99,11 +99,21 @@ def _analyze_screenshot_with_aux_llm(screenshot_path: Path, question: str) -> st
         f"or CAPTCHAs, describe what type they are and what action might be needed. "
         f"Focus on answering the user's specific question."
     )
-    _screenshot_bytes = screenshot_path.read_bytes()
-    _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
-    data_url = f"data:image/png;base64,{_screenshot_b64}"
+    # Pre-send budget (#8120 sibling path). The raw file's base64 used to go on the wire
+    # here with the only downscale gated on the provider REJECTING it as too large — and
+    # with no byte ceiling at all, unlike the vision_analyze aux path. A merely slow
+    # provider never rejects, and browser captures use `--full`, so a long page on a
+    # Retina display is easily multi-MB past the budget. Bound it up front exactly like
+    # the native arm above (long edge AND bytes).
+    from tools.vision_tools import _EMBED_MAX_DIMENSION, _resize_image_for_vision
+    from tools.vision_tools_history_budget import resolve_embed_target_bytes
+
+    data_url = _resize_image_for_vision(screenshot_path, mime_type="image/png",
+                                        max_base64_bytes=resolve_embed_target_bytes(),
+                                        max_dimension=_EMBED_MAX_DIMENSION, force_jpeg=True)
     vision_model = _bt._get_vision_model()
-    _bt.logger.debug("browser_vision: analysing screenshot (%d bytes)", len(_screenshot_bytes))
+    _bt.logger.debug("browser_vision: analysing screenshot (%.1f KB on the wire)",
+                     len(data_url) / 1024)
 
     vision_timeout = 120.0
     vision_temperature = 0.1
