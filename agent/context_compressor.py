@@ -32,6 +32,7 @@ from agent.auxiliary_client import (
     extract_content_or_reasoning,
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
+from agent.context_compressor_attribution import AuxRouteAttributionMixin
 from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -2174,7 +2175,7 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 }
 
 
-class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMixin, ContextEngine):
+class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMixin, AuxRouteAttributionMixin, ContextEngine):
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
 
@@ -2236,34 +2237,6 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
             telemetry["protected_head_tokens"] = estimate_messages_tokens_rough(head_messages)
             telemetry["middle_window_tokens"] = estimate_messages_tokens_rough(middle_messages)
             telemetry["protected_tail_tokens"] = estimate_messages_tokens_rough(tail_messages)
-
-    def _record_aux_compression_call(
-        self, *, prompt_messages: list[dict[str, Any]], max_tokens: int | None, duration_ms: int,
-        aux_provider: str | None = None, aux_model: str | None = None,
-        effective_aux_context: int | None = None, phase_timings: dict[str, Any] | None = None,
-    ) -> None:
-        telemetry = getattr(self, "_active_compression_telemetry", None)
-        if not isinstance(telemetry, dict):
-            return
-        telemetry["aux_prompt_tokens"] = estimate_messages_tokens_rough(prompt_messages)
-        telemetry["aux_output_reservation"] = _safe_int(max_tokens)
-        if aux_provider:
-            telemetry["aux_provider"] = aux_provider
-        if aux_model:
-            telemetry["aux_model"] = aux_model
-        if effective_aux_context is not None:
-            telemetry["effective_aux_context"] = _safe_int(effective_aux_context)
-        if telemetry["effective_aux_context"] is not None and telemetry["aux_prompt_tokens"] is not None:
-            telemetry["fit_margin"] = (telemetry["effective_aux_context"] - telemetry["aux_prompt_tokens"]
-                                       - (telemetry["aux_output_reservation"] or 0))
-        telemetry["aux_call_duration_ms"] = (telemetry.get("aux_call_duration_ms") or 0) + max(0, int(duration_ms))
-        for key in ("queue_wait_ms", "prompt_build_ms", "time_to_first_progress_ms", "summary_generation_ms", "commit_ms"):
-            if not isinstance(phase_timings, dict) or key not in phase_timings:
-                continue
-            value = _safe_int(phase_timings[key])
-            # Wait and generation phases accumulate across retries; the rest are point readings.
-            accumulate = key in {"queue_wait_ms", "summary_generation_ms"} and value is not None
-            telemetry[key] = (telemetry.get(key) or 0) + value if accumulate else value
 
     def _emit_init_summary_once(self) -> None:
         """Emit the init log line once, on first context-length resolution (keeps __init__ non-blocking)."""
@@ -2380,6 +2353,9 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         # may differ from ``summary_model``/``model``). Recorded so a failed auto-resolved model is
         # named in the user-visible warning and falls back to the main model (#116472).
         self._last_aux_resolved_model = None
+        # Aux wire/config identity + per-attempt failure class for the abort
+        # diagnostic (#72636) — see AuxRouteAttributionMixin.
+        self._init_aux_route_attribution()
         self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
         # Sustained-overload escalation bookkeeping (#123167): per-session, reset by success.
         self._consecutive_overload_aborts = 0
@@ -3986,6 +3962,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         """Issue the single aux summary call; return validated content text.
         Raises RuntimeError for empty content or a length-truncated (PARTIAL) summary so the failure
         routes through main-model fallback + cooldown instead of wiping the compacted turns."""
+        # Per-attempt attribution reset + config-layer identity capture, BEFORE
+        # dispatch (#72636) — see AuxRouteAttributionMixin.
+        self._prepare_aux_route_attribution()
         # call_llm writes the route it actually selected; never pre-resolve a second, stale pair.
         _aux_route: dict[str, str] = {}
         call_kwargs: dict[str, Any] = {
@@ -4016,7 +3995,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         try:
             # Compression is atomic: shield the summary call from gateway interrupts. Re-entrant.
             with aux_interrupt_protection():
-                response = call_llm(**call_kwargs)
+                response = call_llm(route_callback=self._record_aux_route, **call_kwargs)
         finally:
             route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
             _aux_model = _aux_route.get("model") or self.summary_model or self.model or ""
@@ -4037,7 +4016,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             raise AuxiliaryExplicitCancellation()
         # Reasoning-field fallback (DeepSeek/Qwen/Kimi put the summary in reasoning_content); capped.
         content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
-        where = f"(provider={self.provider or 'auto'} model={self.summary_model or self.model})"
+        where = self._aux_route_label(_aux_route)
         # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels) return a well-formed HTTP 200
         # with an empty or whitespace-only ``content`` instead of an error or empty ``choices``. That
         # payload passes ``_validate_llm_response`` (a ``message`` exists), so it reaches here and would
@@ -4305,11 +4284,13 @@ Write only the summary body. Do not include any preamble or prefix."""
         if access_error:
             # Field name kept for caller compatibility; now covers the whole access/quota class.
             self._last_summary_auth_failure = True
+            self._last_attempt_failure_class = "auth"
         if kind.json_decode and not kind.model_not_found and not kind.timeout:
+            _ident_provider, _ident_model, _ident_base_url = self._summary_failure_identity()
             logger.error(
                 "Context compression failed: auxiliary LLM returned a non-JSON response. provider=%s "
                 "summary_model=%s main_model=%s base_url=%s err=%s",
-                self.provider or "auto", self.summary_model or "(main)", self.model, self.base_url or "default", e,
+                _ident_provider, _ident_model, self.model, _ident_base_url, e,
             )
         # A distinct summary model gets ONE main-model retry: a specific reason for known transient classes,
         # else a best-effort "failed" retry — losing N turns is worse than one extra summary attempt.
@@ -4345,10 +4326,13 @@ Write only the summary body. Do not include any preamble or prefix."""
             # destroying the middle window for a placeholder marker — retrying once the provider recovers is
             # strictly better than dropping context (#29559, #25585, #94448).
             self._last_summary_network_failure = True
+            self._last_attempt_failure_class = "network"
         elif kind.truncated:
             self._last_summary_truncated_failure = True
+            self._classify_attempt_failure("other")
         elif kind.empty_content:
             self._last_summary_empty_content_failure = True
+            self._classify_attempt_failure("other")
         elif kind.overloaded and not access_error:
             # A 403/402 that also says "overloaded" is an auth/quota abort (#29559), not an
             # overload strike: counting it would let the next real 503 skip its grace (#115906).
@@ -4362,6 +4346,9 @@ Write only the summary body. Do not include any preamble or prefix."""
                 # The latest failure class decides: a stale network/empty/truncated/auth flag from
                 # an earlier failure (only a success clears those) must not keep aborting forever.
                 self._clear_terminal_summary_failures()
+            self._classify_attempt_failure("other")
+        elif self._last_attempt_failure_class is None:
+            self._classify_attempt_failure("other")
         logger.warning(
             "Failed to generate context summary: %s. Further summary attempts paused for %d seconds.", e,
             _transient_cooldown,
