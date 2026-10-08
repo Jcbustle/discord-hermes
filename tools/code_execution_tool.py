@@ -726,6 +726,13 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided. execute_code requires a non-empty 'code' "
                           "parameter containing Python source. To run shell commands, use terminal(command=...) instead.")
+    # Raw input synthesis / cua-driver kills are refused by the terminal pre-exec chain
+    # (#105293); mirror that unconditionally here — otherwise `os.system("... keybd_event ...")`
+    # is a straight bypass, the same shape already fixed for the lifecycle guard below.
+    from tools.terminal_tool_guards import unmanaged_input_block
+    _unmanaged_block = unmanaged_input_block(command=code)
+    if _unmanaged_block:
+        return tool_error(json.loads(_unmanaged_block)["error"])
     # Hard-block gateway-lifecycle commands (mirrors the terminal_tool guard — otherwise
     # `os.system("launchctl bootout ...")` here bypasses it and SIGTERMs the gateway mid-task).
     # Gated on PID-file ownership, not the inherited env marker.
