@@ -1,0 +1,23 @@
+name: hermes-vision-inline
+repo: https://github.com/BrokeSkill/hermes-vision-inline
+sha: c53781510f0c32b01c528a8d94417ee6701df798
+description: >-
+  Attach images and video inline to the session model when it accepts them,
+  and fall back to the auxiliary vision model when it does not. The media
+  stays in context, so follow-ups do not reprocess it and the model reads the
+  pixels directly instead of a written description. The model's modality comes
+  from the local models.dev cache; there are no network calls and nothing to
+  configure.
+maintainer: BrokeSkill
+tier: community
+category: tools
+docs_url: https://github.com/BrokeSkill/hermes-vision-inline#readme
+version: "1.0.0"
+image: https://raw.githubusercontent.com/BrokeSkill/hermes-vision-inline/c53781510f0c32b01c528a8d94417ee6701df798/docs/banner.png
+platforms: [windows, macos, linux]
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware:
+  - tool_execution
+  requires_env: []
