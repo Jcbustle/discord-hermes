@@ -24176,6 +24176,18 @@
             "default": null,
             "title": "Description"
           },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Display Name"
+          },
           "model": {
             "anyOf": [
               {
@@ -24307,6 +24319,18 @@
             ],
             "default": null,
             "title": "Description"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Display Name"
           },
           "model": {
             "anyOf": [
