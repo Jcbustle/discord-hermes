@@ -587,8 +587,15 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
 
 
 def _sandbox_tools_for(enabled_tools: Optional[List[str]]) -> frozenset:
-    """Enabled ∩ SANDBOX_ALLOWED_TOOLS, or every sandbox tool when the intersection is empty."""
-    return frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())) or SANDBOX_ALLOWED_TOOLS
+    """Enabled ∩ SANDBOX_ALLOWED_TOOLS; ``None`` keeps the unrestricted legacy set.
+
+    No overlap fails closed (#121089 review): a session scoped to toolsets that
+    share nothing with the sandbox allow-list must not have the sandbox re-admit
+    the full set — that re-admitted ``terminal`` on a ``code_execution``-only grant.
+    """
+    if enabled_tools is None:
+        return frozenset(SANDBOX_ALLOWED_TOOLS)
+    return frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
 
 
 def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
