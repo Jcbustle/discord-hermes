@@ -742,6 +742,28 @@ async def test_proxy_turn_uses_native_cot_lifecycle(outcome, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_real_proxy_error_marks_cot_failed():
+    transport = FakeCOTClient()
+    client = FeishuCOTClient(
+        "app", "secret", "feishu", request_json=transport.request_json
+    )
+    cot = await client.start("oc", None, "brief")
+    gateway = object.__new__(GatewayRunner)
+    gateway._get_proxy_url = lambda: None
+    source = SessionSource(platform=Platform.FEISHU, chat_id="oc")
+    result = await gateway._run_agent_via_proxy("query", "", [], source, "sid")
+    turn = TurnRunner(gateway, TurnContext(
+        native_cot=cot, source=source, _run_still_current=lambda: True,
+    ))
+    await turn.finish_native_cot(result)
+    await asyncio.gather(*gateway._background_tasks)
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["error"] == result["final_response"]
+    assert transport.calls[-1][1].endswith("reason=error")
+
+
+@pytest.mark.asyncio
 async def test_authentication_early_return_marks_cot_failed():
     transport = FakeCOTClient()
     client = FeishuCOTClient(
