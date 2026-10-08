@@ -1,7 +1,7 @@
 """Single-use OAuth grant hygiene: strip cloned grants from profiles, heal forked grants.
 
-Split out of ``hermes_cli/auth.py`` and re-exported there; origin helpers are imported lazily
-inside each function so ``hermes_cli.auth.<name>`` patches still intercept (and no import cycle).
+Authentication owns grant hygiene and its caches. Profile cloning and credential-pool
+loading call this module directly; persisted grant formats and root ownership are unchanged.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from hermes_cli.auth_constants import _decode_jwt_claims
+from auth.token_validation import _decode_jwt_claims, _nonempty_str
 from utils import file_signature
 
 # Log-record parity with the origin module (caplog tests pin "hermes_cli.auth").
@@ -24,7 +24,12 @@ logger = logging.getLogger("hermes_cli.auth")
 # ``refresh_token_reused``.
 # Profiles must never receive a copy: ONE grant lives at the global root and named profiles read
 # it through the ``read_credential_pool`` root fallback.
-SINGLE_USE_REFRESH_POOL_PROVIDERS = frozenset({"anthropic", "openai-codex", "xai-oauth", "nous"})
+SINGLE_USE_REFRESH_POOL_PROVIDERS = frozenset({
+    "anthropic",
+    "openai-codex",
+    "xai-oauth",
+    "nous",
+})
 
 # Singleton credential files holding the same single-use grants outside ``auth.json``. Copying one
 # into a profile re-seeds a forked pool row on the profile's next ``load_pool()``.
@@ -72,7 +77,7 @@ def merge_snapshot_auth_preserving_live_single_use_grants(
     lineage. Historical single-use refresh material with no live counterpart is dropped because
     there is no local evidence that it is still redeemable. Current live grants always survive.
     """
-    from hermes_cli.auth import _credential_token_pair, _merge_pool_row_generation
+    from auth.pool_persistence import _credential_token_pair, _merge_pool_row_generation
 
     restored = copy.deepcopy(snapshot_store)
     snapshot_pool = restored.get("credential_pool")
@@ -217,7 +222,7 @@ def strip_cloned_single_use_oauth_grants(profile_dir: Path) -> Dict[str, Any]:
     "files": [...]}`` of what was stripped. Never raises: a clone must not fail because hygiene
     could not run — the caller logs the summary.
     """
-    from hermes_cli.auth import _same_path, _save_auth_store
+    from auth.store import _same_path, _save_auth_store
     stripped: Dict[str, Any] = {"pool": [], "providers": [], "files": []}
     profile_dir = Path(profile_dir)
     for name in SINGLE_USE_OAUTH_SINGLETON_FILES:
@@ -288,7 +293,12 @@ def strip_cloned_single_use_oauth_grants(profile_dir: Path) -> Dict[str, Any]:
 
 
 _OAUTH_TOKEN_FIELDS = (
-    "access_token", "refresh_token", "expires_at", "expires_at_ms", "last_refresh")
+    "access_token",
+    "refresh_token",
+    "expires_at",
+    "expires_at_ms",
+    "last_refresh",
+)
 
 _oauth_heal_notices: List[str] = []
 
@@ -314,7 +324,7 @@ def _json_shape(fingerprint: tuple) -> list:
 def _oauth_heal_clean_mark_path() -> Optional[Path]:
     """Where the persisted clean marks live, or None when unavailable."""
     try:
-        from hermes_cli.auth import _auth_file_path
+        from auth.store import _auth_file_path
 
         return _auth_file_path().parent / "cache" / _OAUTH_HEAL_CLEAN_MARK_FILENAME
     except Exception:
@@ -387,7 +397,6 @@ def consume_oauth_heal_notices() -> List[str]:
 
     ``hermes auth list`` / ``hermes auth status`` print them so the user sees the consolidation.
     """
-    from hermes_cli.auth import _oauth_heal_notices
     notes = list(_oauth_heal_notices)
     _oauth_heal_notices.clear()
     return notes
@@ -399,7 +408,6 @@ def _oauth_identity(entry: Dict[str, Any]) -> Optional[str]:
     Codex / xAI access tokens are JWTs with ``sub`` / ``email`` / ``chatgpt_account_id`` claims;
     Anthropic ``sk-ant-oat`` tokens carry none (None → lineage rests on id / token material).
     """
-    from hermes_cli.auth import _nonempty_str
     if not isinstance(entry, dict):
         return None
     for token in (entry.get("access_token"), entry.get("id_token")):
@@ -420,7 +428,7 @@ def _oauth_freshness(entry: Dict[str, Any]) -> float:
     A rotation always issues a later-expiring access token, so ``expires_at`` ordering identifies
     the live copy; ``last_refresh`` and the JWT ``exp`` claim are fallbacks.
     """
-    from agent.credential_pool import _parse_absolute_timestamp
+    from auth.credential_pool import _parse_absolute_timestamp
     stamps = [entry.get(k) for k in ("expires_at_ms", "expires_at", "last_refresh")]
     best = max((ts for ts in map(_parse_absolute_timestamp, stamps) if ts), default=0.0)
     if best == 0.0:
@@ -436,7 +444,6 @@ def _find_root_counterpart(
     Only a copied row ID or shared token material establishes lineage. The same
     account/client can issue multiple independent grants; identity is not proof.
     """
-    from hermes_cli.auth import _nonempty_str
     candidates = [i for i, r in enumerate(root_rows) if _is_oauth_pool_payload(r)]
     if not candidates:
         return None
@@ -456,7 +463,7 @@ def _find_root_counterpart(
 
 def _adopt_oauth_material(target: Dict[str, Any], winner: Dict[str, Any]) -> Dict[str, Any]:
     """Return *target* carrying *winner*'s token pair, status markers cleared."""
-    from hermes_cli.auth import _POOL_STATUS_FIELDS
+    from auth.pool_persistence import _POOL_STATUS_FIELDS
     merged = dict(target)
     for key in _OAUTH_TOKEN_FIELDS:
         if winner.get(key) is not None:
@@ -567,7 +574,7 @@ def owned_profile_reads_root_state(
 
     Seeding that state re-copies root's single-use refresh token into the profile's pool, which
     is the fork #100339 forbids; the singleton seeders skip it."""
-    from hermes_cli.auth import _global_auth_file_path, _same_path
+    from auth.store import _global_auth_file_path, _same_path
     global_root = _global_auth_file_path()
     return bool(
         source_path is not None and global_root is not None and _same_path(source_path, global_root)
@@ -653,7 +660,7 @@ class _HealPass:
     def heal_profile_singleton(self, profile_singleton: Optional[Path]) -> None:
         if profile_singleton is None or not profile_singleton.exists():
             return
-        from hermes_cli.auth import _is_same_auth_store
+        from auth.store import _is_same_auth_store
         if self.root_singleton is not None and _is_same_auth_store(profile_singleton, self.root_singleton):
             return  # an aliased singleton pair is one shared grant, not a fork: never self-compare/unlink
         # See #101356.
@@ -723,10 +730,16 @@ class _HealPass:
 
 
 def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str, Any]]:
-    from hermes_cli.auth import (
-        _auth_file_path, _auth_store_lock, _global_auth_file_path, _load_auth_store,
-        _is_same_auth_store, _oauth_heal_clean_marks, _oauth_heal_notices, _same_path,
-        _save_auth_store)
+    from auth.store import (
+        _auth_file_path,
+        _auth_store_lock,
+        _global_auth_file_path,
+        _load_auth_store,
+        _is_same_auth_store,
+        _same_path,
+        _save_auth_store,
+    )
+
     root_path = _global_auth_file_path()
     if root_path is None:
         return None  # classic mode: nothing to consolidate into
@@ -734,13 +747,17 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
         # Same seat belt as the write-through paths: never touch the real user's
         # ~/.hermes/auth.json from a test that forgot to isolate HOME.
         real_home_env = os.environ.get("HOME", "")
-        if real_home_env and _same_path(root_path, Path(real_home_env) / ".hermes" / "auth.json"):
+        if real_home_env and _same_path(
+            root_path, Path(real_home_env) / ".hermes" / "auth.json"
+        ):
             return None
     profile_path = _auth_file_path()
     profile_home = profile_path.parent
     is_anthropic = provider_id == "anthropic"
     profile_singleton = profile_home / ".anthropic_oauth.json" if is_anthropic else None
-    root_singleton = root_path.parent / ".anthropic_oauth.json" if is_anthropic else None
+    root_singleton = (
+        root_path.parent / ".anthropic_oauth.json" if is_anthropic else None
+    )
 
     # Hot-path short-circuit: load_pool() runs per model call. Once this profile's store was
     # verified clean for *provider_id*, skip the locked read-modify-write until one of the files
@@ -754,8 +771,12 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
     # a metadata-preserving rewrite (``rsync -t``, ``tar -p``, a restore) would otherwise leave
     # a stale mark looking current indefinitely rather than for one process.
     fingerprint = (
-        str(profile_path), _stat_sig(profile_path), _stat_sig(profile_singleton),
-        str(root_path), _stat_sig(root_path), _stat_sig(root_singleton),
+        str(profile_path),
+        _stat_sig(profile_path),
+        _stat_sig(profile_singleton),
+        str(root_path),
+        _stat_sig(root_path),
+        _stat_sig(root_singleton),
     )
     if _oauth_heal_clean_marks.get(provider_id) == fingerprint:
         return None
@@ -775,16 +796,25 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
         # Nothing to consolidate; the mtime mark keeps this off the per-call hot path.
         _mark_oauth_heal_clean(provider_id, fingerprint)
         # See #101356.
-        logger.debug("%s: forked-OAuth heal skipped, %s is the root store", provider_id, profile_path)
+        logger.debug(
+            "%s: forked-OAuth heal skipped, %s is the root store",
+            provider_id,
+            profile_path,
+        )
         return None
 
     # Lock order: active (profile) store first, then the root source store — the same order
     # ``_provider_state_transaction`` uses.
     with _auth_store_lock():
         profile_store = (
-            _load_auth_store(profile_path) if profile_path.exists() else {"providers": {}})
+            _load_auth_store(profile_path)
+            if profile_path.exists()
+            else {"providers": {}}
+        )
         with _auth_store_lock(target_path=root_path):
-            root_store = _load_auth_store(root_path) if root_path.exists() else {"providers": {}}
+            root_store = (
+                _load_auth_store(root_path) if root_path.exists() else {"providers": {}}
+            )
             run = _HealPass(profile_store, root_store, provider_id, root_singleton)
             run.heal_pool_rows()
             run.heal_provider_block()
@@ -801,11 +831,19 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
                     root_store["credential_pool"] = {provider_id: run.r_rows}
                 _save_auth_store(root_store, target_path=root_path)
             singleton_row = run.root_singleton_row
-            if summary["adopted"] and root_singleton is not None and singleton_row is not None:
-                from agent.anthropic_credentials import _write_hermes_oauth_credentials
+            if (
+                summary["adopted"]
+                and root_singleton is not None
+                and singleton_row is not None
+            ):
+                from auth.providers.anthropic import _write_hermes_oauth_credentials
+
                 _write_hermes_oauth_credentials(
-                    singleton_row.get("access_token") or "", singleton_row.get("refresh_token"),
-                    singleton_row.get("expires_at_ms"), target=root_singleton)
+                    singleton_row.get("access_token") or "",
+                    singleton_row.get("refresh_token"),
+                    singleton_row.get("expires_at_ms"),
+                    target=root_singleton,
+                )
             if run.profile_changed and profile_path.exists():
                 _save_auth_store(profile_store, target_path=profile_path)
     message = run.notice(profile_home.name)
