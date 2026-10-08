@@ -6,6 +6,8 @@ from the same session and aggregate them before dispatching.
 """
 
 import asyncio
+from dataclasses import replace
+from typing import TypedDict
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,6 +15,14 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SessionSource
 from gateway.platforms.event import MessageEvent, MessageType
+
+
+class _EventContext(TypedDict, total=False):
+    reply_to_message_id: str | None
+    reply_to_text: str | None
+    reply_to_author_id: str | None
+    reply_to_author_name: str | None
+    reply_to_is_own_message: bool
 
 
 def _make_adapter():
@@ -29,6 +39,7 @@ def _make_adapter():
     adapter._fatal_error_message = None
     adapter._fatal_error_retryable = True
     adapter._drop_delayed_deliveries = False
+    adapter._background_tasks = set()
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
     adapter._pending_photo_batches = {}
@@ -53,11 +64,25 @@ def _make_adapter():
     return adapter
 
 
-def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
+def _make_event(
+    text: str,
+    chat_id: str = "12345",
+    *,
+    reply_to_message_id: str | None = None,
+    reply_to_text: str | None = None,
+    reply_to_author_id: str | None = None,
+    reply_to_author_name: str | None = None,
+    reply_to_is_own_message: bool = False,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_type=MessageType.TEXT,
         source=SessionSource(platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"),
+        reply_to_message_id=reply_to_message_id,
+        reply_to_text=reply_to_text,
+        reply_to_author_id=reply_to_author_id,
+        reply_to_author_name=reply_to_author_name,
+        reply_to_is_own_message=reply_to_is_own_message,
     )
 
 
@@ -214,6 +239,7 @@ class TestHoldInboundAcrossReconnect:
         assert [c.args[0].text for c in new.handle_message.call_args_list] == ["late-salvage"]
         assert old._held_inbound_events == []
         assert old._update_admission.get().accepted  # receipt recorded: no replay after restart
+
 
     @pytest.mark.asyncio
     async def test_flush_during_disconnect_holds_popped_event(self):
@@ -531,3 +557,105 @@ class TestHoldInboundAcrossReconnect:
         await adapter._redispatch_held_inbound()
         held_texts = [e.text for e in adapter._held_inbound_events]
         assert held_texts == ["boom", "after"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary,disconnect",
+    [
+        pytest.param("same", False, id="same-quote"),
+        pytest.param("reply_to_message_id", False, id="different-target"),
+        pytest.param("reply_to_text", False, id="different-quote"),
+        pytest.param("reply_to_author_id", False, id="different-author-id"),
+        pytest.param("reply_to_author_name", False, id="different-author-name"),
+        pytest.param("reply_to_is_own_message", False, id="different-author-kind"),
+        pytest.param("plain-first", False, id="plain-before-reply"),
+        pytest.param("plain-last", False, id="plain-after-reply"),
+        pytest.param("long-continuation", False, id="client-split-reply"),
+        pytest.param("reply_to_message_id", True, id="disconnect-at-boundary"),
+    ],
+)
+async def test_reply_batches_preserve_context_and_pending_delivery(
+    boundary, disconnect
+):
+    adapter = _make_adapter()
+    adapter._text_batch_delay_seconds = 0
+    adapter._text_batch_split_delay_seconds = 0
+    context: _EventContext = {
+        "reply_to_message_id": "reply-42",
+        "reply_to_text": "quoted text",
+        "reply_to_author_id": "author-a",
+        "reply_to_author_name": "Author A",
+        "reply_to_is_own_message": False,
+    }
+    first_context: _EventContext = {} if boundary == "plain-first" else context
+    second_context: _EventContext = (
+        {} if boundary in {"plain-last", "long-continuation"} else context.copy()
+    )
+    if boundary in context:
+        second_context[boundary] = (
+            True if boundary == "reply_to_is_own_message" else "different"
+        )
+    first_text = (
+        "x" * adapter._SPLIT_THRESHOLD if boundary == "long-continuation" else "first"
+    )
+    first = _make_event(first_text, **first_context)
+    second = _make_event("second", **second_context)
+    expected = (
+        [replace(first, text=f"{first_text}\nsecond")]
+        if boundary in {"same", "long-continuation"}
+        else [replace(first), replace(second)]
+    )
+
+    adapter._enqueue_text_event(first)
+    adapter._enqueue_text_event(second)
+    if disconnect:
+        adapter._mark_disconnected()
+        await adapter._cancel_pending_delivery_tasks()
+        assert adapter.handle_message.await_args_list == []
+        assert adapter._held_inbound_events == expected
+        assert (adapter._pending_text_batches, adapter._pending_text_batch_tasks) == (
+            {},
+            {},
+        )
+        return
+
+    assert adapter._held_inbound_redispatch_task is None
+    await asyncio.gather(
+        *adapter._background_tasks, *adapter._pending_text_batch_tasks.values()
+    )
+    assert [call.args[0] for call in adapter.handle_message.await_args_list] == expected
+
+
+@pytest.mark.asyncio
+async def test_reply_boundary_teardown_preserves_in_flight_and_pending_events():
+    adapter = _make_adapter()
+    adapter._text_batch_delay_seconds = 3600
+    adapter._text_batch_split_delay_seconds = 3600
+    first = _make_event("first", reply_to_message_id="reply-a")
+    second = _make_event("second", reply_to_message_id="reply-b")
+    expected = [replace(first), replace(second)]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def dispatch(event):
+        if event is first:
+            entered.set()
+            await release.wait()
+
+    adapter.handle_message.side_effect = dispatch
+    adapter._enqueue_text_event(first)
+    adapter._enqueue_text_event(second)
+    boundaries = tuple(adapter._background_tasks)
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        adapter._mark_disconnected()
+        await asyncio.wait_for(adapter._cancel_pending_delivery_tasks(), timeout=5)
+        actual = (adapter._held_inbound_events, all(t.done() for t in boundaries))
+        assert actual == (expected, True)
+    finally:
+        release.set()
+        tasks = (*boundaries, *adapter._pending_text_batch_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5)
