@@ -38,6 +38,10 @@ _CLONE_CONFIG_FILES = ["config.yaml", ".env", "SOUL.md"]
 # Subdirectory files copied during --clone: memory files are part of the agent's curated
 # identity, as important as SOUL.md for continuity.
 _CLONE_SUBDIR_FILES = ["memories/MEMORY.md", "memories/USER.md"]
+# Copied files that must be owner-only in the clone. ``copy2`` preserves the source's mode
+# bits, so a loose source (umask 0o644) would leak credentials (``.env``) and agent memory
+# (the stores under ``memories/``) into every new profile.
+_PRIVATE_CLONE_FILES = {".env", "memories/MEMORY.md", "memories/USER.md"}
 
 # Runtime files stripped after --clone-all. A post-copy step rather than an ignore filter
 # because they are created dynamically and may be absent at copy time.
@@ -1199,15 +1203,16 @@ def _seed_file_if_missing(path: Path, text: str, mode: Optional[int] = None) -> 
 
 
 def _clone_file(source_dir: Path, profile_dir: Path, relpath: str) -> None:
-    """Copy one profile-relative file if it exists. ``.env`` is tightened to owner-only:
-    ``copy2`` preserves source mode bits, so a loose source (umask 0o644) would leak."""
+    """Copy one profile-relative file if it exists. Owner-only files (``.env`` and the memory
+    stores) are tightened to 0o600: ``copy2`` preserves source mode bits, so a loose source
+    (umask 0o644) would leak credentials and agent memory into every new profile."""
     src = source_dir / relpath
     if not src.exists():
         return
     dst = profile_dir / relpath
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-    if relpath == ".env":
+    if relpath in _PRIVATE_CLONE_FILES:
         with contextlib.suppress(OSError):
             os.chmod(str(dst), 0o600)
 
@@ -1285,6 +1290,15 @@ def _clone_all_into(source_dir: Path, profile_dir: Path, canon: str) -> None:
     if materialized:
         logger.info("profile %s: materialized symlinked %s so the clone never writes through to %s",
                     canon, materialized, source_dir)
+    # copytree preserves source mode bits: tighten owner-only files the same way --clone does,
+    # so a loose source .env / memory store does not leak into every clone. Only files that
+    # exist as regular files are tightened — a materialized symlink has already been replaced
+    # by a private copy above, and a still-symlinked target lives outside the profile.
+    for relpath in _PRIVATE_CLONE_FILES:
+        candidate = profile_dir / relpath
+        if candidate.is_file() and not candidate.is_symlink():
+            with contextlib.suppress(OSError):
+                os.chmod(str(candidate), 0o600)
     # Excluded history dirs (sessions/, cron/) must still exist as empty dirs so the clone runs.
     for subdir in _PROFILE_DIRS:
         (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
