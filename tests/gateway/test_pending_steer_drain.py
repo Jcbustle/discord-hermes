@@ -7,6 +7,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent
+from gateway.platforms.base_pending import release_pending_dispatch
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 from gateway.turn_context import TurnContext
@@ -72,6 +73,7 @@ async def test_accepted_steer_and_events_drain_once_in_order(kind):
         delivered.append(text)
         if event is not None:
             delivered_events.append(event)
+            release_pending_dispatch(adapter, key, event, claimed=True)
         result = {"final_response": "done"}
     assert delivered == expected
     if events:
