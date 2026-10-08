@@ -4197,6 +4197,7 @@ class GatewayTurnMixin:
         Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
         long_running_notifications=off disables)."""
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
+        from gateway.run_turn_status import build_heartbeat_status_detail
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
@@ -4222,15 +4223,7 @@ class GatewayTurnMixin:
             )
             _a = self._agent_activity_summary(agent_holder[0])
             with suppress(Exception):
-                if _a:
-                    _parts = []
-                    if _want_iteration_detail:
-                        _parts.append(format_iteration_progress(_a["api_call_count"], _a["max_iterations"]))
-                    _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                    if _action:
-                        _parts.append(str(_action))
-                    if _parts:
-                        _status_detail = " — " + ", ".join(_parts)
+                _status_detail = build_heartbeat_status_detail(_a, include_iteration=_want_iteration_detail)
             _heartbeat_text = (
                 disp._generic_status_phrase("status")
                 if _long_running_mode == "generic"
