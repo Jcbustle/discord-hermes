@@ -24,6 +24,7 @@ _HERMES_CORE_TOOLS = [
     "todo_list", "memory",
     "session_search",
     "clarify",
+    "schedule_wake",
     "execute_code", "delegate_task",
     "cronjob_manage",
     "kanban_show", "kanban_list",
@@ -154,6 +155,11 @@ TOOLSETS = {
         platforms=frozenset({"desktop"}),
     ),
     "clarify": _ts("Ask the user clarifying questions (multiple-choice or open-ended)", ["clarify"]),
+    "wake": _ts(
+        "One-shot self-wake: arm a deadline so an idle session re-enters its loop with "
+        "no user input (#122444)",
+        ["schedule_wake"],
+    ),
     "code_execution": _ts("Run Python scripts that call tools programmatically (reduces LLM round trips)", ["execute_code"]),
     "delegation": _ts("Spawn subagents with isolated context for complex subtasks", ["delegate_task"]),
     "kanban": _ts(
