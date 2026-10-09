@@ -22,10 +22,14 @@ def _single_query_clarify_callback(questions: list) -> dict:
 
     The oneshot path answers immediately via ``_oneshot_clarify_callback``; single-query turns need the same
     headless behavior (#94943).
+
+    Consent-semantic options are never auto-picked: without a human they are
+    explicitly DECLINED, never treated as consent (#107068).
     """
-    return {"answers": {}, "outcome": "undelivered", "notice": (
-        "single-query mode: no user available to answer. Pick the best choices using your own "
-        "judgment, or make the most reasonable assumption you can, and continue.")}
+    from tools.clarify_tool import headless_clarify_guidance
+
+    return {"answers": {}, "outcome": "undelivered", "notice": headless_clarify_guidance(
+        questions, "single-query mode: no user available to answer. ")}
 
 
 def _current_runtime(cli) -> dict:

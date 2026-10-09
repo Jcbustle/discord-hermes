@@ -3,6 +3,7 @@ Schema, validation and a thin dispatcher; the UI lives in a platform-provided
 callback (cli.py, gateway/run.py, tui_gateway)."""
 
 import json
+import re
 from typing import Callable, Dict, List, Optional
 
 MAX_CHOICES = 4  # the UI always appends an "Other (type your answer)" row
@@ -31,6 +32,51 @@ def strip_recommended(text: str) -> str:
     if stripped.casefold().endswith(RECOMMENDED_LABEL.casefold()):
         return stripped[: -len(RECOMMENDED_LABEL)].strip()
     return stripped
+
+
+# Authorization verbs that make a clarify option consent-semantic: picking one
+# without a human is self-authorization, not a routing default (#107068).
+# Deliberately narrow (fail-closed only on explicit consent phrasing, EN + ZH);
+# innocuous options ("json", "Rebase", "Improve performance") must not match.
+_CONSENT_RE = re.compile(
+    r"authori[sz]|consent|permit|permission|\ballow\s+me\b|\blet\s+me\b"
+    r"|approv|grant\s+me|self-?approv|bypass|授权|批准|准许",
+    re.IGNORECASE,
+)
+
+
+def is_authorization_semantic(text: object) -> bool:
+    """True when a clarify option asks for human authorization (consent-semantic)."""
+    return bool(text) and bool(_CONSENT_RE.search(strip_recommended(str(text))))
+
+
+def headless_clarify_guidance(questions: list, prefix: str) -> str:
+    """Headless (no-human) clarify notice shared by the -q and -z callbacks.
+
+    Consent-semantic choices are explicitly DECLINED and excluded from the
+    auto-pick list; when no non-consent choice remains, the agent must stop
+    and report instead of picking. Consent-free forms keep the legacy notice
+    byte-identical.
+    """
+    declined, safe = [], []
+    for entry in questions or []:
+        for choice in (entry.get("choices") or []):
+            (declined if is_authorization_semantic(choice) else safe).append(choice)
+    if not declined:
+        return prefix + (
+            "Pick the best choices using your own judgment, or make the most "
+            "reasonable assumption you can, and continue."
+        )
+    if safe:
+        return prefix + (
+            f"Choices {declined} require a human and are DECLINED without one — "
+            "do NOT pick them. Pick the best of the remaining choices using your "
+            "own judgment and continue."
+        )
+    return prefix + (
+        f"Every choice {declined} requires a human and is DECLINED without one — "
+        "do NOT pick any. Stop and report that human input is needed."
+    )
 
 
 def _clean_answer(raw, multi: bool):

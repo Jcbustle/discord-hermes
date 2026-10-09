@@ -659,7 +659,12 @@ def _close_agent(agent, session_db, relay_session_id=None) -> None:
 
 
 def _oneshot_clarify_callback(questions: list) -> dict:
-    """Clarify is disabled in oneshot mode — tell the agent to pick a default and proceed."""
-    return {"answers": {}, "outcome": "undelivered", "notice": (
-        "oneshot mode: no user available. Pick the best choices using your own judgment, "
-        "or make the most reasonable assumption you can, and continue.")}
+    """Clarify is disabled in oneshot mode — tell the agent to pick a default and proceed.
+
+    Consent-semantic options are never auto-picked: without a human they are
+    explicitly DECLINED, never treated as consent (#107068).
+    """
+    from tools.clarify_tool import headless_clarify_guidance
+
+    return {"answers": {}, "outcome": "undelivered", "notice": headless_clarify_guidance(
+        questions, "oneshot mode: no user available. ")}
