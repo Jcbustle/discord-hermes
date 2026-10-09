@@ -983,9 +983,9 @@ _POOL_TOKEN_GENERATION_FIELDS = (
     "access_token", "refresh_token", "expires_at", "expires_at_ms", "expires_in", "obtained_at",
     "last_refresh", "agent_key", "agent_key_expires_at", "agent_key_expires_in", "agent_key_id",
     "agent_key_obtained_at", "agent_key_reused",
-    # Refresh-coupled metadata: a Nous refresh rewrites scope and the validated
-    # inference route together with the new pair, so they travel with it.
-    "scope", "inference_base_url",
+    # Refresh-coupled metadata: scopes, identity and validation state must follow
+    # the pair; stale writers must not mix a new pair with old metadata.
+    "scope", "inference_base_url", "chatgpt",
 )
 
 
@@ -1022,7 +1022,7 @@ def _merge_pool_row_generation(
 
     merge_disk = None if status_cleared else disk_entry
     disk_pair = _credential_token_pair(disk_entry)
-    if base_pair is None or not any(disk_pair) or disk_pair == base_pair:
+    if base_pair is None or disk_entry is None or disk_pair == base_pair:
         return _merge_disk_cooldown_state(entry, merge_disk, provider_id)
 
     merged = dict(entry)

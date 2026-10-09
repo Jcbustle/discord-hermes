@@ -22,7 +22,7 @@ from hermes_cli.config import load_env
 from agent.secret_scope import get_secret as _get_secret, get_secret_str
 from agent.retry_utils import reset_delay_from_message
 from hermes_cli.auth_plugin_providers import plugin_refresh_hook
-from agent.credential_pool_plugin import apply_plugin_refresh_result, plugin_row_is_expiring, recover_failed_plugin_refresh
+from agent.credential_pool_plugin import apply_plugin_refresh_result, plugin_row_is_expired, plugin_row_is_expiring, recover_failed_plugin_refresh
 from agent.credential_persistence import (
     fingerprint_secret_value,
     is_borrowed_credential_source,
@@ -1093,21 +1093,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             )
             return min(candidates) if candidates else None
 
-    def entries(self) -> list[PooledCredential]:
-        with self._lock:
-            return list(self._entries)
-
     def _is_sole_credential(self) -> bool:
         """DEAD entries never re-enter rotation, so <=1 non-DEAD entry means nothing to rotate to."""
         return sum(1 for e in self._entries if e.last_status != STATUS_DEAD) <= 1
-
-    def _find(self, predicate: Callable[[PooledCredential], bool]) -> Optional[PooledCredential]:
-        return next((e for e in self._entries if predicate(e)), None)
-
-    def _current_unlocked(self) -> Optional[PooledCredential]:
-        if not self._current_id:
-            return None
-        return self._find(lambda e: e.id == self._current_id)
 
     def current(self) -> Optional[PooledCredential]:
         with self._lock:
@@ -1167,7 +1155,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 pair = self._persisted_token_pairs.get(entry.id, (None, None))
                 # Reference-only rows are intentionally secret-free on disk; never dehydrate
                 # their live in-memory credential while adopting a concurrent generation.
-                if row is None or not any(pair):
+                if row is None or (not any(pair) and is_borrowed_credential_source(entry.source, self.provider)):
                     continue
                 # Adopt only rows the store overrode with a peer's newer pair; re-hydrating an
                 # unchanged row would replace the live object (and pull peer cooldown state
@@ -1306,8 +1294,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         reference-only rows whose secrets are stripped before reaching
         auth.json, so re-reading yields empty tokens that would be adopted as
         a "rotation" — blanking a usable credential. The singleton file, not
-        the pool store, is token authority for those sources; a row with no
-        token material at all is refused for the same reason.
+        the pool store, is token authority for those sources. Owned plugin rows
+        also adopt cleared pairs so a peer's logout cannot be undone by refresh.
         """
         if self.provider not in ("anthropic", "xai-oauth") and plugin_refresh_hook(self.provider) is None:
             return entry
@@ -1327,9 +1315,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             # (blank) generation, recorded before the no-token-material bail-out below.
             self._persisted_token_pairs[entry.id] = auth_mod._credential_token_pair(persisted)
             stored = PooledCredential.from_dict(self.provider, persisted)
-            # No token material at all is never a "rotation" (anthropic borrowed rows, a plugin row a
-            # peer blanked mid-write): adopting it would replace a usable credential with nothing.
-            if not is_xai and not (stored.access_token or "").strip() and not (stored.refresh_token or "").strip():
+            owns_plugin_tokens = (plugin_refresh_hook(self.provider) is not None
+                                  and not is_borrowed_credential_source(entry.source, self.provider))
+            if not (is_xai or owns_plugin_tokens) and not (stored.access_token or "").strip() and not (stored.refresh_token or "").strip():
                 return entry
             if stored.access_token != entry.access_token or stored.refresh_token != entry.refresh_token:
                 logger.debug(
@@ -1553,6 +1541,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     return synced
                 return self._refresh_entry_impl(synced, force=force)
             synced = self._sync_entry_from_pool_store(entry)
+            if not synced.access_token and not synced.refresh_token:
+                return None
             if self.provider == "anthropic" and synced.source == "claude_code":
                 # claude_code entries are NOT profile-owned: the refresh token
                 # lives in one shared ~/.claude/.credentials.json (or Keychain)
@@ -1568,7 +1558,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     if synced.refresh_token != entry.refresh_token:
                         return synced
                     return self._refresh_entry_impl(synced, force=force)
-            if synced.access_token != entry.access_token or synced.refresh_token != entry.refresh_token:
+            if (synced.access_token != entry.access_token or synced.refresh_token != entry.refresh_token) and not (
+                    plugin_refresh_hook(self.provider) is not None and plugin_row_is_expired(synced)):
                 return synced
             return self._refresh_entry_impl(synced, force=force)
 
@@ -1762,6 +1753,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         # Sync back so _seed_from_singletons() on the next load_pool() sees
         # fresh state instead of re-seeding consumed tokens.
         self._sync_device_code_entry_to_auth_store(updated)
+        if plugin_refresh_hook(self.provider) is not None and plugin_row_is_expired(updated):
+            return None
         return updated
 
     def _recover_failed_refresh(self, entry: PooledCredential, exc: Exception) -> Optional[PooledCredential]:
@@ -2035,17 +2028,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 time.sleep(_REFRESH_SWEEP_SPACING_SECONDS)
             self._refresh_entry(entry, force=False)
 
-    def _reset_cleared_after(self, entry: PooledCredential) -> Optional[float]:
-        """Epoch of a ``hermes auth reset`` persisted by another process AFTER *entry*'s status, else None."""
-        try:
-            row = next((p for p in read_credential_pool(self.provider)
-                        if isinstance(p, dict) and p.get("id") == entry.id), None)
-            cleared = _parse_absolute_timestamp((row or {}).get("status_cleared_at"))
-        except Exception as exc:
-            logger.debug("Pool entry %s: could not read reset marker: %s", entry.id, exc)
-            return None
-        return cleared if cleared and cleared > (entry.last_status_at or 0.0) else None
-
     def _resync_stale_entry(self, entry: PooledCredential) -> PooledCredential:
         """Re-read an exhausted/DEAD singleton-seeded entry from its token authority.
 
@@ -2057,6 +2039,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         """
         if entry.last_status not in {STATUS_EXHAUSTED, STATUS_DEAD}:
             return entry
+        if plugin_refresh_hook(self.provider) is not None:
+            synced = self._sync_entry_from_pool_store(entry)
+            if synced is not entry:
+                return synced
         cleared_at = self._reset_cleared_after(entry)
         if cleared_at is not None:
             return self._adopt(entry, persist=False, **_MARK_OK, status_cleared_at=cleared_at)
@@ -2086,6 +2072,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         available: list[PooledCredential] = []
         pending_refresh: list[PooledCredential] = []
         sole_credential = self._is_sole_credential()
+        from providers import get_provider_profile
+        profile = get_provider_profile(self.provider)
         for entry in self._entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load; never lease an
@@ -2096,6 +2084,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if synced is not entry:
                 entry = synced
                 cleared_any = True
+            if profile is not None and not profile.credential_is_eligible(entry):
+                continue
             if entry.last_status == STATUS_DEAD:
                 # Manual DEAD credentials are pruned after a 24h quiet window;
                 # singleton-seeded ones stay (audit trail, and the seeder would
@@ -2145,6 +2135,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 # A borrowed OAuth row that failed to hydrate (or a sanitized
                 # row read straight off disk); leasing it would send an empty
                 # bearer. The API-key guard above does not cover it.
+                continue
+            # Refresh and external re-auth can change the grant after the initial gate.
+            if profile is not None and not profile.credential_is_eligible(entry):
                 continue
             available.append(entry)
         if entries_to_prune:

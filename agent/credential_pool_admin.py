@@ -1,12 +1,15 @@
 """Locked credential-pool administration and target resolution."""
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
-from typing import Any, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent.credential_pool import PooledCredential
+
+logger = logging.getLogger(__name__)
 
 
 def _cleared_status_copy(entry: PooledCredential) -> PooledCredential:
@@ -23,6 +26,31 @@ class CredentialNotSavedError(RuntimeError):
 
 
 class CredentialPoolAdminMixin:
+    def entries(self) -> list[PooledCredential]:
+        with self._lock:
+            return list(self._entries)
+
+    def _find(self, predicate: Callable[[PooledCredential], bool]) -> Optional[PooledCredential]:
+        return next((e for e in self._entries if predicate(e)), None)
+
+    def _current_unlocked(self) -> Optional[PooledCredential]:
+        if not self._current_id:
+            return None
+        return self._find(lambda e: e.id == self._current_id)
+
+    def _reset_cleared_after(self, entry: PooledCredential) -> Optional[float]:
+        """Epoch of a ``hermes auth reset`` persisted by another process AFTER *entry*'s status, else None."""
+        from agent.credential_pool import _parse_absolute_timestamp, read_credential_pool
+
+        try:
+            row = next((p for p in read_credential_pool(self.provider)
+                        if isinstance(p, dict) and p.get("id") == entry.id), None)
+            cleared = _parse_absolute_timestamp((row or {}).get("status_cleared_at"))
+        except Exception as exc:
+            logger.warning("Pool entry %s: could not read reset marker: %s", entry.id, exc, exc_info=True)
+            return None
+        return cleared if cleared and cleared > (entry.last_status_at or 0.0) else None
+
     def reset_status(self, credential_id: str) -> Optional[PooledCredential]:
         """Clear only the target's local error state, preserving sibling cooldowns."""
         with self._lock:

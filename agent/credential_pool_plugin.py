@@ -15,7 +15,9 @@ Contract (documented in website/docs/developer-guide/model-provider-plugin.md):
   rotate and the pool benches the row like a failed refresh POST;
 * raising ``AuthError(..., relogin_required=True)`` (or a grant-dead OAuth code)
   is terminal: the row goes DEAD with a WARNING naming ``hermes auth add``;
-  any other exception is transient and only benches the row.
+  any other exception is transient and only benches the row;
+* a returned ``expires_at_ms`` that has already elapsed is persisted for recovery,
+  but never handed to a caller as a usable refreshed credential.
 """
 
 from __future__ import annotations
@@ -43,6 +45,11 @@ def plugin_row_is_expiring(entry: "PooledCredential") -> bool:
     ``ya29.*``) with no JWT ``exp`` to decode, so without this a long session sends the dead bearer.
     """
     return entry.expires_at_ms is not None and int(entry.expires_at_ms) <= int(time.time() * 1000) + _EXPIRY_SKEW_MS
+
+
+def plugin_row_is_expired(entry: "PooledCredential") -> bool:
+    """An expired refresh result can be persisted for recovery, but never dispatched."""
+    return entry.expires_at_ms is not None and int(entry.expires_at_ms) <= int(time.time() * 1000)
 
 
 def apply_plugin_refresh_result(entry: "PooledCredential", result: Any) -> "PooledCredential":
@@ -89,10 +96,19 @@ def recover_failed_plugin_refresh(
     from agent.credential_pool import _MARK_OK
 
     synced = pool._sync_entry_from_pool_store(entry)
+    if not synced.access_token and not synced.refresh_token:
+        return True, None
     if synced.refresh_token != entry.refresh_token and (synced.access_token or "").strip():
+        if plugin_row_is_expired(synced):
+            return True, None
         logger.debug("%s refresh failed but the pool store has newer tokens — adopting", pool.provider)
         return True, pool._adopt(synced, **_MARK_OK)
     if is_terminal_plugin_refresh_error(exc):
+        from providers import get_provider_profile
+        profile = get_provider_profile(pool.provider)
+        if profile is not None and profile.clear_credential is not None:
+            cleared = apply_plugin_refresh_result(entry, profile.clear_credential(entry))
+            pool._replace_entry(entry, cleared)
         # WARNING, not debug: this is the moment a login is lost. Benching for a TTL would replay
         # the dead token every cooldown at DEBUG with no trace for the user.
         logger.warning(
